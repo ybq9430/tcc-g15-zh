@@ -5,6 +5,13 @@
 
 ![界面预览](screenshots/preview-zh.png)
 
+## 直接下载
+
+**[⬇ tcc-g15-zh-win64.zip](https://github.com/ybq9430/tcc-g15-zh/releases/latest)**（约 47MB，免安装）
+
+解压到任意目录，双击 `tcc-g15.exe`，UAC 弹窗点「是」即可运行，无需安装 Python 或任何运行库。
+这是从上游 v1.6.5 源码重新编译的版本，非替换文件。
+
 ## 这是什么
 
 Dell G 系列 / Alienware 笔记本出厂自带的 AWCC（Alienware Command Center）体积臃肿、手动风扇控制失效、还会偷偷上传遥测数据。本项目是它的开源替代品，基于 Dell 的 WMI 散热控制接口实现。
