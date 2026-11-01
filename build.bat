@@ -7,10 +7,12 @@ echo ========================================
 
 pyinstaller ^
   --icon=icons/gaugeIcon.ico ^
+  --uac-admin ^
   --add-data "icons/gaugeIcon.png;icons" ^
   --add-data "tcc_g15_task.xml;." ^
   --add-data "src/GUI/translations;translations" ^
   --hidden-import PySide6 ^
+  --hidden-import PySide6.QtNetwork ^
   --collect-all winrt ^
   -w -y src/tcc-g15.py
 if errorlevel 1 goto :error

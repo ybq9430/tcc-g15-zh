@@ -10,6 +10,16 @@
 **[⬇ tcc-g15-zh-win64.zip](https://github.com/ybq9430/tcc-g15-zh/releases/latest)**（约 47MB，免安装）
 
 解压到任意目录，双击 `tcc-g15.exe`，UAC 弹窗点「是」即可运行，无需安装 Python 或任何运行库。
+程序清单已声明 `requireAdministrator`，双击就会自动请求提权，不用再右键找「以管理员身份运行」。
+
+想把压缩包直接装到 `C:\Program Files (x86)\Thermal Control Center\`（开始菜单快捷方式指向的位置），
+在解压目录里以管理员身份执行一次：
+
+```bat
+tcc-g15.exe --install
+```
+
+它会自动结束正在运行的旧实例、镜像文件、校验 SHA256，然后启动新版本。加 `--no-launch` 则只装不启。
 这是从上游 v1.6.5 源码重新编译的版本，非替换文件。
 
 ## 这是什么
@@ -141,8 +151,22 @@ Dell G 系列 / Alienware 笔记本出厂自带的 AWCC（Alienware Command Cent
 ## 使用
 
 程序需要**管理员权限**（访问 WMI 接口所必需），启动时会弹 UAC，点「是」即可。
+可执行文件已内嵌 `requireAdministrator` 清单，**双击就会自动请求提权**。
 
-已打包的版本：见 [Releases](../../releases)。下载后解压，右键 `tcc-g15.exe` → 以管理员身份运行。
+已打包的版本：见 [Releases](../../releases)。下载解压后双击 `tcc-g15.exe` 即可。
+
+### 安装到 Program Files
+
+如果希望从开始菜单统一启动，在解压目录里以管理员身份运行：
+
+```bat
+tcc-g15.exe --install              :: 装到 Program Files (x86) 并启动
+tcc-g15.exe --install --no-launch  :: 只装不启
+tcc-g15.exe --install --to "D:\Apps\TCC"   :: 装到自定义目录
+```
+
+安装器会结束旧实例、镜像 `_internal`、逐文件校验 SHA256，并把过程写到
+`%LOCALAPPDATA%\TCC-G15\logs\install.log`。升级时重复执行同一条命令即可。
 
 ## 从源码构建
 
@@ -181,6 +205,13 @@ python tcc-g15.py
 
 另外：GPU / CPU 曲线拆分、转速平滑渐变、托盘菜单新增「查看温度历史…」直达入口、
 诊断页新增「打开日志目录」按钮。
+
+安装方面也补了两件事：
+
+- **内嵌管理员清单**：之前双击只拿到普通权限，WMI 会返回 `0x80041003`（拒绝访问），
+  必须右键「以管理员身份运行」才能用。现在双击就会自动弹 UAC。
+- **新增 `--install` 自安装**：结束旧实例 → 镜像文件 → 校验 SHA256 → 启动，
+  一条命令完成升级，不必再手动解压覆盖。
 
 ## 已知问题
 
