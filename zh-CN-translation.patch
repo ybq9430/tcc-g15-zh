@@ -1,10 +1,186 @@
+diff -ruN tcc-g15-master/src/Backend/AWCCThermal.py zh-src/src/Backend/AWCCThermal.py
+--- tcc-g15-master/src/Backend/AWCCThermal.py	2026-10-23 18:53:08.297948700 +0900
++++ zh-src/src/Backend/AWCCThermal.py	2026-11-01 18:41:44.222179700 +0900
+@@ -64,3 +64,19 @@
+ 
+     def setMode(self, mode: ModeType) -> bool:
+         return self._awcc.ApplyThermalMode(mode)
++
++    def probeSensors(self, maxId: int = 12) -> list:
++        """扫描 0..maxId 号传感器，返回有读数的 [(id, 温度)]。
++
++        用来发现没被 GetFanIdsAndRelatedSensorsIds 登记的隐藏传感器。
++        单个 ID 读取失败属正常情况，跳过即可。
++        """
++        found = []
++        for sensorId in range(0, maxId + 1):
++            try:
++                value = self._awcc.GetSensorTemperature(sensorId)
++            except Exception:
++                value = None
++            if value is not None:
++                found.append((sensorId, value))
++        return found
+diff -ruN tcc-g15-master/src/Backend/GameDetector.py zh-src/src/Backend/GameDetector.py
+--- tcc-g15-master/src/Backend/GameDetector.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/Backend/GameDetector.py	2026-11-01 18:38:40.248151600 +0900
+@@ -0,0 +1,101 @@
++"""
++猜测前台是不是在跑全屏游戏。
++
++Dell 的 WMI 不提供「当前是什么应用」，所以只能用启发式：
++前台窗口铺满整个显示器 + 进程名不在排除表里 = 大概率是游戏。
++
++这个判断必然有误判（比如浏览器按 F11 全屏看视频），所以：
++1. 默认关闭，由用户在设置里主动打开
++2. 排除表可编辑
++3. 调用方需要自己做防抖，避免窗口切换时频繁切换模式
++"""
++
++import ctypes
++import os
++from ctypes import wintypes
++from typing import List, Optional, Tuple
++
++_user32 = ctypes.windll.user32
++_kernel32 = ctypes.windll.kernel32
++
++_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
++_MONITOR_DEFAULTTONEAREST = 2
++_TOLERANCE_PX = 6
++
++DEFAULT_EXCLUSIONS: List[str] = [
++    "explorer", "chrome", "msedge", "firefox", "opera", "brave", "iexplore",
++    "code", "devenv", "idea64", "pycharm64", "goland64", "webstorm64",
++    "windowsterminal", "powershell", "pwsh", "cmd", "conhost",
++    "wechat", "qq", "telegram", "discord", "slack",
++    "potplayermini64", "vlc", "mpc-hc64", "spotify",
++]
++
++
++class _RECT(ctypes.Structure):
++    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
++                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
++
++
++class _MONITORINFO(ctypes.Structure):
++    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _RECT),
++                ("rcWork", _RECT), ("dwFlags", wintypes.DWORD)]
++
++
++def foregroundProcessName() -> Optional[str]:
++    """前台窗口所属进程名（小写，不含 .exe）。拿不到时返回 None。"""
++    hwnd = _user32.GetForegroundWindow()
++    if not hwnd:
++        return None
++    pid = wintypes.DWORD()
++    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
++    if not pid.value:
++        return None
++    hProc = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
++    if not hProc:
++        return None
++    try:
++        buf = ctypes.create_unicode_buffer(1024)
++        size = wintypes.DWORD(len(buf))
++        if not _kernel32.QueryFullProcessImageNameW(hProc, 0, buf, ctypes.byref(size)):
++            return None
++        return os.path.splitext(os.path.basename(buf.value))[0].lower()
++    finally:
++        _kernel32.CloseHandle(hProc)
++
++
++def isForegroundFullscreen() -> bool:
++    """前台窗口是否铺满所在显示器"""
++    hwnd = _user32.GetForegroundWindow()
++    if not hwnd or not _user32.IsWindowVisible(hwnd):
++        return False
++    rect = _RECT()
++    if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
++        return False
++    hMonitor = _user32.MonitorFromWindow(hwnd, _MONITOR_DEFAULTTONEAREST)
++    if not hMonitor:
++        return False
++    info = _MONITORINFO()
++    info.cbSize = ctypes.sizeof(_MONITORINFO)
++    if not _user32.GetMonitorInfoW(hMonitor, ctypes.byref(info)):
++        return False
++    mon = info.rcMonitor
++    return (
++        abs(rect.left - mon.left) <= _TOLERANCE_PX and
++        abs(rect.top - mon.top) <= _TOLERANCE_PX and
++        abs(rect.right - mon.right) <= _TOLERANCE_PX and
++        abs(rect.bottom - mon.bottom) <= _TOLERANCE_PX
++    )
++
++
++def detectFullscreenGame(exclusions: Optional[List[str]] = None) -> Tuple[bool, Optional[str]]:
++    """返回 (是否判定为全屏游戏, 进程名)"""
++    if exclusions is None:
++        exclusions = DEFAULT_EXCLUSIONS
++    name = foregroundProcessName()
++    if name is None:
++        return (False, None)
++    if name in {e.strip().lower() for e in exclusions if e.strip()}:
++        return (False, name)
++    if name in ("progman", "workerw", "shellexperiencehost", "textinputhost"):
++        return (False, name)
++    return (isForegroundFullscreen(), name)
+diff -ruN tcc-g15-master/src/Backend/PowerMonitor.py zh-src/src/Backend/PowerMonitor.py
+--- tcc-g15-master/src/Backend/PowerMonitor.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/Backend/PowerMonitor.py	2026-11-01 18:38:26.089016700 +0900
+@@ -0,0 +1,30 @@
++"""读取笔记本电源状态：是否接着交流电、电池电量。"""
++
++import ctypes
++from ctypes import wintypes
++from typing import Optional, Tuple
++
++
++class _SYSTEM_POWER_STATUS(ctypes.Structure):
++    _fields_ = [
++        ("ACLineStatus", wintypes.BYTE),
++        ("BatteryFlag", wintypes.BYTE),
++        ("BatteryLifePercent", wintypes.BYTE),
++        ("SystemStatusFlag", wintypes.BYTE),
++        ("BatteryLifeTime", wintypes.DWORD),
++        ("BatteryFullLifeTime", wintypes.DWORD),
++    ]
++
++
++def powerStatus() -> Tuple[Optional[bool], Optional[int]]:
++    """返回 (是否接着交流电, 电池百分比)。读不到时对应位置为 None。
++
++    ACLineStatus: 0=电池供电, 1=交流电, 255=未知
++    BatteryLifePercent: 0~100, 255=未知
++    """
++    status = _SYSTEM_POWER_STATUS()
++    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
++        return (None, None)
++    onAc = None if status.ACLineStatus == 255 else (status.ACLineStatus == 1)
++    percent = None if status.BatteryLifePercent == 255 else int(status.BatteryLifePercent)
++    return (onAc, percent)
 Binary files tcc-g15-master/src/Backend/__pycache__/AWCCThermal.cpython-313.pyc and zh-src/src/Backend/__pycache__/AWCCThermal.cpython-313.pyc differ
 Binary files tcc-g15-master/src/Backend/__pycache__/AWCCWmiWrapper.cpython-313.pyc and zh-src/src/Backend/__pycache__/AWCCWmiWrapper.cpython-313.pyc differ
 Binary files tcc-g15-master/src/Backend/__pycache__/DetectHardware.cpython-313.pyc and zh-src/src/Backend/__pycache__/DetectHardware.cpython-313.pyc differ
+Binary files tcc-g15-master/src/Backend/__pycache__/GameDetector.cpython-313.pyc and zh-src/src/Backend/__pycache__/GameDetector.cpython-313.pyc differ
+Binary files tcc-g15-master/src/Backend/__pycache__/PowerMonitor.cpython-313.pyc and zh-src/src/Backend/__pycache__/PowerMonitor.cpython-313.pyc differ
 diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
 --- tcc-g15-master/src/GUI/AppGUI.py	2026-10-23 18:53:08.312425300 +0900
-+++ zh-src/src/GUI/AppGUI.py	2026-11-01 16:54:12.769168900 +0900
-@@ -56,7 +56,7 @@
++++ zh-src/src/GUI/AppGUI.py	2026-11-01 18:55:26.437211300 +0900
+@@ -9,6 +9,11 @@
+ from GUI.ThermalUnitWidget import ThermalUnitWidget
+ from GUI.QGaugeTrayIcon import QGaugeTrayIcon
+ from GUI import HotKey
++from GUI.FanCurve import FanCurve
++from GUI.HistoryChartWidget import HistoryBuffer
++from GUI.SettingsDialog import SettingsDialog
++from GUI.SettingsKeys import SettingsKey
++from Backend import PowerMonitor, GameDetector
+ from Backend.DetectHardware import DetectHardware
+ 
+ GUI_ICON = 'icons/gaugeIcon.png'
+@@ -56,7 +61,7 @@
  
      cbDontAskAgain = None
      if dontAskAgain:
@@ -13,14 +189,23 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
          msg.setCheckBox(cbDontAskAgain)
  
      return (msg.exec_() == QtWidgets.QMessageBox.Yes, cbDontAskAgain is not None and cbDontAskAgain.isChecked() or None)
-@@ -75,8 +75,29 @@
+@@ -75,34 +80,56 @@
  
  class ThermalMode(Enum):
      Balanced = 'Balanced'
 +    Silent = 'Silent'      # 本版本新增：软件模拟的静音模式（后端复用 Custom 接管风扇）
      G_Mode = 'G_Mode'
      Custom = 'Custom'
-+
+-    
+-class SettingsKey(Enum):
+-    Mode = "app/mode"
+-    CPUFanSpeed = "app/fan/cpu/speed"
+-    CPUThresholdTemp = "app/fan/cpu/threshold_temp"
+-    GPUFanSpeed = "app/fan/gpu/speed"
+-    GPUThresholdTemp = "app/fan/gpu/threshold_temp"
+-    FailSafeIsOnFlag = "app/failsafe_is_on_flag"
+-    MinimizeOnCloseFlag = "app/minimize_on_close_flag"
+ 
 +# 后端不认识 Silent，需要映射到它支持的 WMI 模式值
 +BACKEND_MODE_PASSTHROUGH = {
 +    ThermalMode.Balanced.value: 'Balanced',
@@ -40,10 +225,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
 +def modeDisplayName(value: str) -> str:
 +    return MODE_NAMES_ZH.get(value, value.replace('_', ' '))
 +
-     
- class SettingsKey(Enum):
-     Mode = "app/mode"
-@@ -90,7 +111,7 @@
++    
  def errorExit(message: str, message2: Optional[str] = None) -> None:
      if not QtWidgets.QApplication.instance():
           QtWidgets.QApplication([])
@@ -52,14 +234,16 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
      sys.exit(1)
  
  class TCC_GUI(QtWidgets.QWidget):
-@@ -99,10 +120,19 @@
+     TEMP_UPD_PERIOD_MS = 1000
++    AUTOMATION_PERIOD_MS = 5000
+     FAILSAFE_CPU_TEMP = 95
      FAILSAFE_GPU_TEMP = 85
      FAILSAFE_TRIGGER_DELAY_SEC = 8
      FAILSAFE_RESET_AFTER_TEMP_IS_OK_FOR_SEC = 60
-+    # 静音模式风扇曲线：(温度上限 °C, 风扇百分比)，取第一个满足 temp < 上限 的档位
-+    # 本机 A/B 实测（空载）：平衡模式 2607/2827RPM ≈ 手动 0% 2605/2815RPM，手动 5% 已升到 3084/3241
-+    # 所以底档必须是 0%，且边界要高于空载温度（约 64-70°C），否则会形成极限环、风扇反复启停
-+    SILENT_CURVE = ((82, 0), (87, 30), (91, 65), (999, 100))
++    GAME_TRIGGER_DELAY_SEC = 3      # 全屏持续这么久才认定是游戏，避免切窗口误触发
++    GAME_EXIT_DELAY_SEC = 8         # 退出全屏这么久后才恢复原模式
++    HISTORY_CAPACITY = 1800         # 历史缓冲 1800 个采样点（约 30 分钟）
++    # 静音模式防抖参数（曲线本身可编辑，见 GUI/FanCurve.py）
 +    SILENT_BAND_MARGIN = 5          # 降档需低于当前档位下界这么多度（档位滞环）
 +    SILENT_DOWN_COOLDOWN_SEC = 45   # 上次升档后至少等这么久才允许降档，避免风扇反复启停
 +    SILENT_REASSERT_SEC = 25        # 即使档位没变也定期重发一次，防止 EC 自行接管回自动曲线
@@ -73,17 +257,42 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
  
      # Green to Yellow and Yellow to Red thresholds
      GPU_COLOR_LIMITS = (72, 85)
-@@ -114,6 +144,9 @@
+@@ -114,6 +141,16 @@
      _failsafeTrippedPrevModeStr: Optional[str] = None   # Mode (Custom, Balanced) before fail-safe tripped, as a string
      _failsafeOn = True
      _prevSavedSettingsValues: list = []
 +    _silentLastBand: dict = {}                          # 静音模式：上次生效的档位索引（用于滞环）
 +    _silentLastChangeTs: dict = {}                      # 静音模式：上次改速的时间戳（用于降档冷静期）
 +    _silentLastWriteTs: dict = {}                       # 静音模式：上次写 EC 的时间戳（用于定期重申）
++
++    _lastAcState: Optional[bool] = None                 # 上次看到的供电状态，用于检测交流/电池切换
++    _gameActive = False                                 # 当前是否判定在跑全屏游戏
++    _gamePrevMode: Optional[str] = None                 # 进游戏前的模式，退出时恢复
++    _gameCandidateSince = 0.0                           # 首次检测到全屏的时间（防抖）
++    _gameIdleSince = 0.0                                # 首次检测到全屏结束的时间（防抖）
++    _autoSwitchGuard = False                            # True 表示这次模式变更是自动化触发的，不算用户手选
  
      _gModeKeySignal = QtCore.Signal()
      _gModeKeyPrevModeStr: Optional[str] = None
-@@ -135,40 +168,40 @@
+@@ -121,6 +158,7 @@
+     _toaster = WindowsToaster(APP_NAME)
+ 
+     _modeSwitch: QRadioButtonSet
++    _settingsDialog: Optional["SettingsDialog"] = None
+ 
+     def __init__(self, awcc: AWCCThermal):
+         super().__init__()
+@@ -129,46 +167,52 @@
+         self.settings = QtCore.QSettings(self.APP_URL, "AWCC")
+         print(f'Settings location: {self.settings.fileName()}')
+ 
++        # 静音曲线与历史缓冲：对话框和主界面共享同一份对象
++        self._curve = FanCurve.fromJson(self.settings.value(SettingsKey.SilentCurveJson.value) or '')
++        self._history = HistoryBuffer(self.HISTORY_CAPACITY)
++
+         # Set main window props
+         self.setFixedSize(600, 0)
+         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowMinimizeButtonHint | QtCore.Qt.WindowCloseButtonHint)
          self.setWindowIcon(QtGui.QIcon(resourcePath(GUI_ICON)))
          self.mouseReleaseEvent = lambda evt: (
              evt.button() == QtCore.Qt.RightButton and
@@ -109,6 +318,8 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
 +        showAction = menu.addAction("显示主界面")
          showAction.triggered.connect(self.showNormal)
 -        addToAutorunAction = menu.addAction("Enable autorun")
++        settingsAction = menu.addAction("设置…")
++        settingsAction.triggered.connect(self.openSettings)
 +        addToAutorunAction = menu.addAction("启用开机自启")
          def autorunTaskRun(action: Literal['add', 'remove']) -> None:
              err = autorunTask(action)
@@ -134,7 +345,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
          exitAction.triggered.connect(self.onExit)
          # Setup tray widget
          tray = QtWidgets.QSystemTrayIcon(self)
-@@ -184,11 +217,11 @@
+@@ -184,11 +228,11 @@
  
          # Set up GUI
          self.setObjectName('QMainWindow')
@@ -149,22 +360,13 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
          self._thermalCPU.setTitle('CPU')
  
          # Detecting GPU/CPU model is a slow operation, run asynchronously
-@@ -218,17 +251,31 @@
+@@ -218,17 +262,22 @@
          lTherm.addWidget(self._thermalGPU)
          lTherm.addWidget(self._thermalCPU)
  
 -        self._modeSwitch = QRadioButtonSet(None, None, list(map(lambda m: (m.name.replace('_', ' '), m.value), ThermalMode)))
 +        self._modeSwitch = QRadioButtonSet(None, None, list(map(lambda m: (modeDisplayName(m.value), m.value), ThermalMode)))
-+        self._modeSwitch.setToolTipFor(
-+            ThermalMode.Silent.value,
-+            "风扇按温度分档自动调速，日常负载下保持最低转速：\n"
-+            "82°C 以下·最低　87°C·30%　91°C·65%　91°C 以上·满转\n"
-+            "降温后需等 45 秒才降档，避免风扇反复启停。\n\n"
-+            "空载噪音与平衡模式相同，收益在于中等负载时不急着把风扇拉高。\n"
-+            "注意：本机手动转速下限约 3000 RPM，与空载时的自动转速接近，\n"
-+            "所以静音模式的收益主要在中等负载时不急着提速，而不是让空载更安静。\n"
-+            "温度保护依然有效，超过阈值仍会切到 G 模式。"
-+        )
++        self._refreshSilentTooltip()
 +        self._modeSwitch.setToolTipFor(
 +            ThermalMode.Custom.value,
 +            "手动拖动下方滑块，直接指定风扇转速。\n有效范围 0~100，0% 约为硬件最低转速（约 3000 RPM），并非停转。"
@@ -184,7 +386,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
                  if self._failsafeTrippedPrevModeStr is not None: # Fail-safe is in tripped state now
                      color = Colors.RED.value
  
-@@ -239,10 +286,10 @@
+@@ -239,10 +288,10 @@
          # Fail-safe temp limits
          self._limitTempGPU = QtWidgets.QComboBox()
          self._limitTempGPU.addItems(list(map(lambda v: str(v), range(50, 91))))
@@ -197,7 +399,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
          def onLimitGPUChange():
              val = self._limitTempGPU.currentText()
              if val.isdigit(): self.FAILSAFE_GPU_TEMP = int(val)
-@@ -253,8 +300,8 @@
+@@ -253,8 +302,8 @@
          self._limitTempCPU.currentIndexChanged.connect(onLimitCPUChange)
  
          # Fail-safe checkbox
@@ -208,7 +410,26 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
          def onFailsafeCB():
              self._failsafeOn = self._failsafeCB.isChecked()
              self._failsafeTempIsHighTs = 0
-@@ -300,16 +347,21 @@
+@@ -275,9 +324,18 @@
+         modeBox.addWidget(QtWidgets.QWidget(), alignment= QtCore.Qt.AlignRight) # Insert dummy Widget in order to move the following 'failsafeBox' to the right side
+         modeBox.addLayout(failsafeBox)
+ 
++        # 设置入口单独放一行，避免和模式选项、温度保护挤在一行撑破 600px 宽度
++        settingsRow = QtWidgets.QHBoxLayout()
++        self._settingsBtn = QtWidgets.QPushButton("设置…")
++        self._settingsBtn.setToolTip("编辑静音风扇曲线、配置电源联动与游戏检测、查看温度历史")
++        self._settingsBtn.clicked.connect(self.openSettings)
++        settingsRow.addStretch(1)
++        settingsRow.addWidget(self._settingsBtn)
++
+         mainLayout = QtWidgets.QVBoxLayout(self)
+         mainLayout.addLayout(lTherm)
+         mainLayout.addLayout(modeBox)
++        mainLayout.addLayout(settingsRow)
+         mainLayout.setAlignment(QtCore.Qt.AlignTop)
+         mainLayout.setContentsMargins(10, 0, 10, 0)
+ 
+@@ -300,16 +358,24 @@
          def onModeChange(val: str):
              self._thermalGPU.setSpeedDisabled(val != ThermalMode.Custom.value)
              self._thermalCPU.setSpeedDisabled(val != ThermalMode.Custom.value)
@@ -231,10 +452,13 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
              for m in ThermalMode:
 -                self._trayMenuModeSwitch[m.value].setText(f"{'•' if m.value == val else ' '} {m.name.replace('_', ' ')}")
 +                self._trayMenuModeSwitch[m.value].setText(f"{'•' if m.value == val else ' '} {modeDisplayName(m.value)}")
++            # 用户手动改模式时，取消「退出游戏后恢复原模式」的打算，免得覆盖用户的选择
++            if not self._autoSwitchGuard and self._gameActive and val != ThermalMode.G_Mode.value:
++                self._gamePrevMode = None
  
          self._modeSwitch.setChecked(ThermalMode.Balanced.value)
          onModeChange(ThermalMode.Balanced.value)
-@@ -328,6 +380,10 @@
+@@ -328,6 +394,10 @@
              if cpuRPM is not None: self._thermalCPU.setFanRPM(cpuRPM)
              # print(gpuTemp, gpuRPM, cpuTemp, cpuRPM)
  
@@ -245,27 +469,190 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
              # Handle fail-safe
              tempIsHigh = (
                  (gpuTemp is None) or (gpuTemp >= self.FAILSAFE_GPU_TEMP) or
-@@ -363,7 +419,7 @@
+@@ -363,7 +433,10 @@
              self.trayIcon = self.trayIcon.resizeForScreen() or self.trayIcon
              self.trayIcon.update((gpuTemp, cpuTemp), self._modeSwitch.getChecked() == ThermalMode.G_Mode.value)
              tray.setIcon(self.trayIcon)
 -            tray.setToolTip(f"GPU:    {gpuTemp} °C    {gpuRPM} RPM\nCPU:    {cpuTemp} °C    {cpuRPM} RPM\nMode:    {self._modeSwitch.getChecked().replace('_', ' ')}")
 +            tray.setToolTip(f"GPU：    {gpuTemp} °C    {gpuRPM} RPM\nCPU：    {cpuTemp} °C    {cpuRPM} RPM\n模式：    {modeDisplayName(self._modeSwitch.getChecked())}")
++
++            # 记录历史，供设置里的曲线/诊断页使用
++            self._history.add(gpuTemp, cpuTemp, gpuRPM, cpuRPM)
              
              # Periodically save app settings
              self._saveAppSettings()
-@@ -382,6 +438,51 @@
+@@ -374,14 +447,206 @@
+         updateAppState()
+         self._updateGaugesTask.start()
+ 
+-        self.gModeHotKey = HotKey.HotKey(HotKey.G_MODE_KEY, self._gModeKeySignal)
++        self._automationTask = QPeriodic(self, self.AUTOMATION_PERIOD_MS, self._checkAutomation)
++        self._automationTask.start()
++
+         self._gModeKeySignal.connect(self._onGModeHotKeyPressed)
+-        self.gModeHotKey.start()
++        self._startHotKey()
+ 
+     def updateGaugeTitles(self, gpuModel, cpuModel):
          if gpuModel: self._thermalGPU.setTitle(gpuModel)
          if cpuModel: self._thermalCPU.setTitle(cpuModel)
  
++    # ---------- 静音曲线 ----------
++
++    def _refreshSilentTooltip(self) -> None:
++        self._modeSwitch.setToolTipFor(
++            ThermalMode.Silent.value,
++            "风扇按温度分档自动调速，日常负载下保持最低转速：\n"
++            f"{self._curve.describe()}\n\n"
++            "降温后需等 45 秒才降档，避免风扇反复启停。\n"
++            "曲线可在「设置 → 风扇曲线」里拖动调整。\n\n"
++            "注意：本机手动转速下限约 2600 RPM，与空载时的自动转速接近，\n"
++            "所以静音模式的收益主要在中等负载时不急着提速，而不是让空载更安静。\n"
++            "温度保护依然有效，超过阈值仍会切到 G 模式。"
++        )
++
++    def _onCurveChanged(self) -> None:
++        self.settings.setValue(SettingsKey.SilentCurveJson.value, self._curve.toJson())
++        self.settings.sync()
++        self._refreshSilentTooltip()
++        # 曲线变了，旧的档位记录全部作废，下一拍重新按新曲线下发
++        self._silentLastBand = {}
++        self._silentLastChangeTs = {}
++        self._silentLastWriteTs = {}
++        print(f'静音曲线已更新: {self._curve.describe()}')
++
++    # ---------- 设置对话框 ----------
++
++    def openSettings(self) -> None:
++        if getattr(self, '_settingsDialog', None) is not None:
++            try:
++                self._settingsDialog.close()
++            except Exception:
++                pass
++        dlg = SettingsDialog(
++            self._curve, self.settings, self._history,
++            tempsProvider=lambda: (self._thermalGPU.getTemp(), self._thermalCPU.getTemp()),
++            sensorScanner=lambda: self._awcc.probeSensors(12),
++            parent=self,
++        )
++        dlg.curveChanged.connect(self._onCurveChanged)
++        dlg.hotKeyChanged.connect(self._onHotKeyChanged)
++        dlg.automationChanged.connect(self._onAutomationChanged)
++        self._settingsDialog = dlg
++        dlg.show()
++        dlg.raise_()
++        dlg.activateWindow()
++
++    # ---------- 热键 ----------
++
++    def _startHotKey(self) -> None:
++        vk = int(self.settings.value(SettingsKey.HotKeyVk.value) or HotKey.G_MODE_KEY)
++        if getattr(self, 'gModeHotKey', None) is not None:
++            self.gModeHotKey.stop()
++            self.gModeHotKey.wait(2000)
++        self.gModeHotKey = HotKey.HotKey(vk, self._gModeKeySignal)
++        self.gModeHotKey.start()
++        print(f'G 模式热键已注册: 0x{vk:02X}')
++
++    def _onHotKeyChanged(self, vk: int) -> None:
++        self.settings.setValue(SettingsKey.HotKeyVk.value, vk)
++        self.settings.sync()
++        self._startHotKey()
++
++    # ---------- 自动化 ----------
++
++    def _flagEnabled(self, key: SettingsKey) -> bool:
++        v = self.settings.value(key.value)
++        return str(v).lower() == 'true' if v is not None else False
++
++    def _exclusions(self) -> List[str]:
++        raw = self.settings.value(SettingsKey.GameExclusions.value)
++        if not raw:
++            return list(GameDetector.DEFAULT_EXCLUSIONS)
++        text = str(raw).replace(',', '\n')
++        return [x.strip().lower() for x in text.splitlines() if x.strip()]
++
++    def _autoSetMode(self, mode: str, reason: str) -> None:
++        print(f'自动化切换 -> {mode}（{reason}）')
++        self._autoSwitchGuard = True
++        try:
++            self._modeSwitch.setChecked(mode)
++        finally:
++            self._autoSwitchGuard = False
++        self._toasterMessageCurrentMode()
++
++    def _checkAutomation(self) -> None:
++        self._checkPowerLink()
++        self._checkGame()
++
++    def _checkPowerLink(self) -> None:
++        if not self._flagEnabled(SettingsKey.PowerLinkFlag):
++            self._lastAcState = None
++            return
++        onAc, _ = PowerMonitor.powerStatus()
++        if onAc is None:
++            return
++        if self._lastAcState is None:
++            self._lastAcState = onAc
++            return
++        if onAc == self._lastAcState:
++            return
++        self._lastAcState = onAc
++        if onAc:
++            target = ThermalMode.Balanced.value
++        else:
++            idx = int(self.settings.value(SettingsKey.PowerLinkBatteryMode.value) or 0)
++            candidates = [ThermalMode.Silent.value, ThermalMode.Balanced.value, ThermalMode.G_Mode.value]
++            target = candidates[max(0, min(len(candidates) - 1, idx))]
++        if self._modeSwitch.getChecked() != target:
++            self._autoSetMode(target, '接入电源' if onAc else '改用电池供电')
++
++    def _checkGame(self) -> None:
++        if not self._flagEnabled(SettingsKey.GameDetectFlag):
++            self._gameActive = False
++            self._gamePrevMode = None
++            self._gameCandidateSince = 0.0
++            self._gameIdleSince = 0.0
++            return
++        isGame, name = GameDetector.detectFullscreenGame(self._exclusions())
++        now = time.time()
++        if isGame:
++            self._gameIdleSince = 0.0
++            if self._gameActive:
++                return
++            if self._gameCandidateSince == 0.0:
++                self._gameCandidateSince = now
++            elif now - self._gameCandidateSince >= self.GAME_TRIGGER_DELAY_SEC:
++                self._gameActive = True
++                self._gameCandidateSince = 0.0
++                self._gamePrevMode = self._modeSwitch.getChecked()
++                if self._gamePrevMode != ThermalMode.G_Mode.value:
++                    self._autoSetMode(ThermalMode.G_Mode.value, f'检测到全屏程序 {name}')
++        else:
++            self._gameCandidateSince = 0.0
++            if not self._gameActive:
++                return
++            if self._gameIdleSince == 0.0:
++                self._gameIdleSince = now
++            elif now - self._gameIdleSince >= self.GAME_EXIT_DELAY_SEC:
++                self._gameActive = False
++                self._gameIdleSince = 0.0
++                prev = self._gamePrevMode or ThermalMode.Balanced.value
++                self._gamePrevMode = None
++                if self._modeSwitch.getChecked() != prev:
++                    self._autoSetMode(prev, '全屏程序已退出')
++
++    def _onAutomationChanged(self) -> None:
++        # 配置变了，重置供电/游戏的判定状态，避免拿旧状态做比较
++        self._lastAcState = None
++        self._gameActive = False
++        self._gamePrevMode = None
++        self._gameCandidateSince = 0.0
++        self._gameIdleSince = 0.0
++
 +    def _silentBandIndex(self, temp: Optional[int]) -> int:
 +        """温度落在曲线第几档；读不到温度时按最高档处理，宁可吵不可热"""
-+        if temp is None:
-+            return len(self.SILENT_CURVE) - 1
-+        for i, (limit, _) in enumerate(self.SILENT_CURVE):
-+            if temp < limit:
-+                return i
-+        return len(self.SILENT_CURVE) - 1
++        return self._curve.bandIndex(temp)
 +
 +    def _applySilentCurve(self, gpuTemp: Optional[int], cpuTemp: Optional[int]) -> None:
 +        """静音模式核心：按温度查档，升档立即生效，降档必须跌出当前档位下界一段才生效"""
@@ -279,10 +666,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
 +            if last is None or idx > last:
 +                newIdx = idx                                   # 首次或升温升档：立即执行
 +            elif idx < last:
-+                if last > 0:
-+                    lowerEdge = self.SILENT_CURVE[last - 1][0]
-+                else:
-+                    lowerEdge = -1000
++                lowerEdge = self._curve.bandLowerEdge(last)
 +                cooledDown = (time.time() - self._silentLastChangeTs.get(name, 0)) >= self.SILENT_DOWN_COOLDOWN_SEC
 +                if cooledDown and temp is not None and temp <= lowerEdge - self.SILENT_BAND_MARGIN:
 +                    newIdx = max(idx, last - 1)                # 降档每次最多退一档，避免转速骤降后又反弹
@@ -294,7 +678,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
 +                # 档位没变：正常情况下不写 EC，但定期重申一次，防止被 EC 自动曲线接管
 +                if (time.time() - self._silentLastWriteTs.get(name, 0)) < self.SILENT_REASSERT_SEC:
 +                    continue
-+            speed = self.SILENT_CURVE[newIdx][1]
++            speed = self._curve.speeds[newIdx]
 +            self._silentLastBand[name] = newIdx
 +            self._silentLastWriteTs[name] = time.time()
 +            if newIdx != last:
@@ -306,7 +690,7 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
      def closeEvent(self, event):
          minimizeOnClose = self.settings.value(SettingsKey.MinimizeOnCloseFlag.value)
          if minimizeOnClose is not None:
-@@ -389,7 +490,7 @@
+@@ -389,7 +654,7 @@
          
          if minimizeOnClose is None:
              # minimizeOnClose is not set, prompt user
@@ -315,7 +699,24 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
              minimizeOnClose = not toExit
              if dontAskAgain:
                  self.settings.setValue(SettingsKey.MinimizeOnCloseFlag.value, minimizeOnClose)
-@@ -434,12 +535,12 @@
+@@ -420,8 +685,15 @@
+         if self.gModeHotKey is not None:
+             self.gModeHotKey.stop()
+             self.gModeHotKey.wait()
+-        if self.gModeHotKey is not None:
++        if self._updateGaugesTask is not None:
+             self._updateGaugesTask.stop()
++        if getattr(self, '_automationTask', None) is not None:
++            self._automationTask.stop()
++        if getattr(self, '_settingsDialog', None) is not None:
++            try:
++                self._settingsDialog.close()
++            except Exception:
++                pass
+         print('Cleanup: done')
+ 
+     def _onGModeHotKeyPressed(self):
+@@ -434,21 +706,28 @@
          self._toasterMessageCurrentMode()
  
      def _toasterMessageCurrentMode(self, source: Optional[Literal['failsafe']] = None) -> None:
@@ -331,7 +732,27 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
              ],
              source != 'failsafe'
          )
-@@ -487,7 +588,7 @@
+ 
+     def toasterMessage(self, message: List[str | None], expire = True) -> None:
+-        toast = Toast(duration=ToastDuration.Short, expiration_time= (datetime.datetime.now() + datetime.timedelta(seconds=5)) if expire else None)
+-        toast.text_fields = message
+-        toast.AddImage(ToastDisplayImage.fromPath(resourcePath(GUI_ICON)))
+-        self._toaster.show_toast(toast)
++        try:
++            toast = Toast(duration=ToastDuration.Short, expiration_time= (datetime.datetime.now() + datetime.timedelta(seconds=5)) if expire else None)
++            toast.text_fields = message
++            # 图标缺失不该让整个程序崩掉——温度保护切换模式也会走到这里
++            try:
++                toast.AddImage(ToastDisplayImage.fromPath(resourcePath(GUI_ICON)))
++            except Exception as ex:
++                print(f'通知图标加载失败（忽略）: {ex}')
++            self._toaster.show_toast(toast)
++        except Exception as ex:
++            print(f'系统通知发送失败（忽略）: {ex}')
+ 
+     def _saveAppSettings(self):
+         curValues = [
+@@ -487,7 +766,7 @@
          self._failsafeCB.setChecked(str(savedFailsafe).lower() == 'true')
  
      def clearAppSettings(self):
@@ -340,10 +761,20 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
          if not isYes: return
          self.settings.clear()
          self._loadAppSettings()
-@@ -495,16 +596,32 @@
+@@ -495,19 +774,23 @@
      def G_Mode_key_Pressed(self, val):
          print("G_Mode_key " + str(val))
  
+-def runApp(startMinimized = False) -> int:
+-    app = QtWidgets.QApplication([])
+-
+-    # Setup backend
+-    try:
+-        awcc = AWCCThermal()
+-    except NoAWCCWMIClass:
+-        errorExit("AWCC WMI class not found in the system.", "You don't have some drivers installed or your system is not supported.")
+-    except CannotInstAWCCWMI:
+-        errorExit("Couldn't instantiate AWCC WMI class.", "Make sure you're running as Admin.")
 +def installChineseTranslator(app: QtWidgets.QApplication) -> None:
 +    """加载 Qt 自带的中文翻译，让消息框的“确定/取消”等系统按钮也显示中文"""
 +    candidates = [
@@ -358,23 +789,663 @@ diff -ruN tcc-g15-master/src/GUI/AppGUI.py zh-src/src/GUI/AppGUI.py
 +            print(f'Qt zh_CN translator loaded from {path}')
 +            return
 +    print('Qt zh_CN translator NOT found')
-+
- def runApp(startMinimized = False) -> int:
-     app = QtWidgets.QApplication([])
+ 
+-    mainWindow = TCC_GUI(awcc)
+-    mainWindow.setStyleSheet(f"""
++def applyAppStylesheet(widget: QtWidgets.QWidget) -> None:
++    widget.setStyleSheet(f"""
+         QGauge {{
+             border: 1px solid gray;
+             border-radius: 3px;
+@@ -534,8 +817,68 @@
+         QComboBox::disabled {{
+             color: {Colors.GREY.value};
+         }}
++        QTabWidget::pane {{
++            border: 1px solid {Colors.GREY.value};
++            border-radius: 3px;
++        }}
++        QTabBar::tab {{
++            background: {Colors.DARK_GREY.value};
++            border: 1px solid {Colors.GREY.value};
++            border-bottom: none;
++            padding: 5px 16px;
++            margin-right: 2px;
++        }}
++        QTabBar::tab:selected {{
++            background: #2c2c2c;
++        }}
++        QPushButton {{
++            border: 1px solid gray;
++            border-radius: 3px;
++            padding: 3px 12px;
++            background-color: #2c2c2c;
++        }}
++        QPushButton:hover {{
++            border-color: {Colors.WHITE.value};
++        }}
++        QPlainTextEdit, QTableWidget {{
++            border: 1px solid gray;
++            border-radius: 3px;
++            background-color: #171717;
++        }}
++        QHeaderView::section {{
++            background-color: #2c2c2c;
++            border: none;
++            border-bottom: 1px solid {Colors.GREY.value};
++            padding: 3px;
++        }}
++        QSlider::groove:horizontal {{
++            height: 4px;
++            background: {Colors.GREY.value};
++            border-radius: 2px;
++        }}
++        QSlider::handle:horizontal {{
++            width: 14px;
++            margin: -6px 0;
++            border-radius: 7px;
++            background: {Colors.BLUE.value};
++        }}
+     """)
+ 
++def runApp(startMinimized = False) -> int:
++    app = QtWidgets.QApplication([])
 +    installChineseTranslator(app)
- 
-     # Setup backend
-     try:
-         awcc = AWCCThermal()
-     except NoAWCCWMIClass:
--        errorExit("AWCC WMI class not found in the system.", "You don't have some drivers installed or your system is not supported.")
++
++    # Setup backend
++    try:
++        awcc = AWCCThermal()
++    except NoAWCCWMIClass:
 +        errorExit("系统中未找到 AWCC WMI 类。", "可能是缺少相关驱动，或你的机型不受支持。")
-     except CannotInstAWCCWMI:
--        errorExit("Couldn't instantiate AWCC WMI class.", "Make sure you're running as Admin.")
++    except CannotInstAWCCWMI:
 +        errorExit("无法实例化 AWCC WMI 类。", "请确认程序是以管理员身份运行的。")
- 
-     mainWindow = TCC_GUI(awcc)
-     mainWindow.setStyleSheet(f"""
++
++    mainWindow = TCC_GUI(awcc)
++    applyAppStylesheet(mainWindow)
++
+     if startMinimized:
+         mainWindow.showMinimized()
+         mainWindow.hide()
+diff -ruN tcc-g15-master/src/GUI/CurveEditorWidget.py zh-src/src/GUI/CurveEditorWidget.py
+--- tcc-g15-master/src/GUI/CurveEditorWidget.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/GUI/CurveEditorWidget.py	2026-11-01 18:37:41.952672800 +0900
+@@ -0,0 +1,244 @@
++"""
++风扇曲线编辑器：直接拖动阶梯图上的控制点。
++
++- 拖动竖直边界：调整温度阈值
++- 拖动线段上的圆点：调整该档的风扇百分比
++- 灰色竖线表示当前 GPU / CPU 实测温度，方便对着真实温度调参
++"""
++
++from typing import Optional, Tuple
++
++from PySide6 import QtCore, QtGui, QtWidgets
++
++from GUI.AppColors import Colors
++from GUI.FanCurve import FanCurve, TEMP_MIN, TEMP_MAX
++
++
++class CurveEditorWidget(QtWidgets.QWidget):
++    curveChanged = QtCore.Signal()
++
++    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 46, 16, 16, 32
++    HIT_RADIUS = 11
++    SPEED_SNAP = 5
++
++    def __init__(self, curve: FanCurve, parent: Optional[QtWidgets.QWidget] = None) -> None:
++        super().__init__(parent)
++        self._curve = curve
++        self._drag: Optional[Tuple[str, int]] = None
++        self._liveTemps: Tuple[Optional[int], Optional[int]] = (None, None)
++        self._hover: Optional[Tuple[str, int]] = None
++        self.setMinimumSize(440, 250)
++        self.setMouseTracking(True)
++        self.setCursor(QtCore.Qt.CrossCursor)
++        self.setToolTip("拖动竖线改温度阈值，拖动圆点改该档转速")
++
++    # ---------- 对外 ----------
++
++    def setCurve(self, curve: FanCurve) -> None:
++        self._curve = curve
++        self.update()
++
++    def curve(self) -> FanCurve:
++        return self._curve
++
++    def setLiveTemps(self, gpu: Optional[int], cpu: Optional[int]) -> None:
++        self._liveTemps = (gpu, cpu)
++        self.update()
++
++    # ---------- 坐标换算 ----------
++
++    def _plotRect(self) -> QtCore.QRectF:
++        return QtCore.QRectF(
++            self.MARGIN_L, self.MARGIN_T,
++            max(1.0, self.width() - self.MARGIN_L - self.MARGIN_R),
++            max(1.0, self.height() - self.MARGIN_T - self.MARGIN_B),
++        )
++
++    def _xForTemp(self, t: float) -> float:
++        r = self._plotRect()
++        return r.left() + (t - TEMP_MIN) / (TEMP_MAX - TEMP_MIN) * r.width()
++
++    def _tempForX(self, x: float) -> float:
++        r = self._plotRect()
++        return TEMP_MIN + (x - r.left()) / r.width() * (TEMP_MAX - TEMP_MIN)
++
++    def _yForSpeed(self, s: float) -> float:
++        r = self._plotRect()
++        return r.bottom() - s / 100.0 * r.height()
++
++    def _speedForY(self, y: float) -> float:
++        r = self._plotRect()
++        return (r.bottom() - y) / r.height() * 100.0
++
++    # ---------- 几何 ----------
++
++    def _segments(self):
++        """[(x起, x止, 转速, 档位索引)]"""
++        eb = self._curve.effectiveBoundaries()
++        speeds = self._curve.speeds
++        out = []
++        for i, spd in enumerate(speeds):
++            t0 = TEMP_MIN if i == 0 else eb[i - 1]
++            t1 = TEMP_MAX if i == len(speeds) - 1 else eb[i]
++            out.append((self._xForTemp(t0), self._xForTemp(t1), spd, i))
++        return out
++
++    def _handles(self):
++        """返回 [(种类, 索引, x, y)]，种类为 'b'(边界) 或 's'(线段)"""
++        out = []
++        segs = self._segments()
++        eb = self._curve.effectiveBoundaries()
++        for i, b in enumerate(eb):
++            x = self._xForTemp(b)
++            y = (self._yForSpeed(segs[i][2]) + self._yForSpeed(segs[i + 1][2])) / 2.0
++            out.append(('b', i, x, y))
++        for x0, x1, spd, i in segs:
++            out.append(('s', i, (x0 + x1) / 2.0, self._yForSpeed(spd)))
++        return out
++
++    def _hitTest(self, pos: QtCore.QPointF):
++        best = None
++        bestDist = self.HIT_RADIUS
++        for kind, idx, x, y in self._handles():
++            d = ((pos.x() - x) ** 2 + (pos.y() - y) ** 2) ** 0.5
++            if d < bestDist:
++                bestDist = d
++                best = (kind, idx)
++        return best
++
++    # ---------- 绘制 ----------
++
++    def paintEvent(self, event) -> None:
++        p = QtGui.QPainter(self)
++        p.setRenderHint(QtGui.QPainter.Antialiasing)
++        r = self._plotRect()
++
++        p.fillRect(self.rect(), QtGui.QColor(Colors.DARK_GREY.value))
++        p.fillRect(r, QtGui.QColor('#171717'))
++
++        font = QtGui.QFont('Microsoft YaHei UI', 8)
++        p.setFont(font)
++
++        # 网格
++        gridPen = QtGui.QPen(QtGui.QColor('#2e2e2e'))
++        gridPen.setWidthF(1.0)
++        p.setPen(gridPen)
++        labelPen = QtGui.QPen(QtGui.QColor(Colors.GREY.value))
++        for t in range(TEMP_MIN, TEMP_MAX + 1, 10):
++            x = self._xForTemp(t)
++            p.setPen(gridPen)
++            p.drawLine(QtCore.QPointF(x, r.top()), QtCore.QPointF(x, r.bottom()))
++            p.setPen(labelPen)
++            p.drawText(QtCore.QRectF(x - 18, r.bottom() + 4, 36, 14),
++                       QtCore.Qt.AlignCenter, f"{t}°")
++        for s in range(0, 101, 20):
++            y = self._yForSpeed(s)
++            p.setPen(gridPen)
++            p.drawLine(QtCore.QPointF(r.left(), y), QtCore.QPointF(r.right(), y))
++            p.setPen(labelPen)
++            p.drawText(QtCore.QRectF(2, y - 8, self.MARGIN_L - 8, 16),
++                       QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{s}%")
++
++        # 曲线下方填充
++        segs = self._segments()
++        poly = QtGui.QPolygonF()
++        poly.append(QtCore.QPointF(segs[0][0], r.bottom()))
++        for x0, x1, spd, _ in segs:
++            y = self._yForSpeed(spd)
++            poly.append(QtCore.QPointF(x0, y))
++            poly.append(QtCore.QPointF(x1, y))
++        poly.append(QtCore.QPointF(segs[-1][1], r.bottom()))
++        fill = QtGui.QColor(Colors.BLUE.value)
++        fill.setAlpha(45)
++        p.setPen(QtCore.Qt.NoPen)
++        p.setBrush(fill)
++        p.drawPolygon(poly)
++        p.setBrush(QtCore.Qt.NoBrush)
++
++        # 阶梯线
++        curvePen = QtGui.QPen(QtGui.QColor(Colors.BLUE.value).lighter(160))
++        curvePen.setWidthF(2.0)
++        p.setPen(curvePen)
++        for x0, x1, spd, _ in segs:
++            y = self._yForSpeed(spd)
++            p.drawLine(QtCore.QPointF(x0, y), QtCore.QPointF(x1, y))
++        eb = self._curve.effectiveBoundaries()
++        for i, b in enumerate(eb):
++            x = self._xForTemp(b)
++            p.drawLine(QtCore.QPointF(x, self._yForSpeed(segs[i][2])),
++                       QtCore.QPointF(x, self._yForSpeed(segs[i + 1][2])))
++
++        # 实时温度标记
++        colors = (QtGui.QColor(Colors.GREEN.value), QtGui.QColor(Colors.YELLOW.value))
++        for i, t in enumerate(self._liveTemps):
++            if t is None:
++                continue
++            x = self._xForTemp(max(TEMP_MIN, min(TEMP_MAX, t)))
++            pen = QtGui.QPen(colors[i])
++            pen.setWidthF(1.2)
++            pen.setStyle(QtCore.Qt.DashLine)
++            p.setPen(pen)
++            p.drawLine(QtCore.QPointF(x, r.top()), QtCore.QPointF(x, r.bottom()))
++            p.setPen(QtGui.QPen(colors[i]))
++            label = f"{'GPU' if i == 0 else 'CPU'} {t}°"
++            onLeft = x < r.center().x()
++            labelRect = QtCore.QRectF(x + 4 if onLeft else x - 74,
++                                      r.top() + 2 + i * 14, 70, 14)
++            p.drawText(labelRect, QtCore.Qt.AlignLeft if onLeft else QtCore.Qt.AlignRight, label)
++
++        # 控制点
++        for kind, idx, x, y in self._handles():
++            active = self._hover == (kind, idx)
++            radius = 6.5 if active else 5.0
++            if kind == 'b':
++                p.setPen(QtGui.QPen(QtGui.QColor(Colors.WHITE.value), 1.5))
++                p.setBrush(QtGui.QColor('#2f2f2f'))
++                p.drawEllipse(QtCore.QPointF(x, y), radius, radius)
++                p.setPen(QtGui.QPen(QtGui.QColor(Colors.WHITE.value), 1.5))
++                p.drawLine(QtCore.QPointF(x, y - 4), QtCore.QPointF(x, y + 4))
++            else:
++                p.setPen(QtGui.QPen(QtGui.QColor(Colors.DARK_GREY.value), 1.5))
++                p.setBrush(QtGui.QColor(Colors.BLUE.value).lighter(170))
++                p.drawEllipse(QtCore.QPointF(x, y), radius, radius)
++
++        p.end()
++
++    # ---------- 交互 ----------
++
++    def mousePressEvent(self, event) -> None:
++        if event.button() != QtCore.Qt.LeftButton:
++            return
++        hit = self._hitTest(event.position())
++        if hit is not None:
++            self._drag = hit
++            self._applyDrag(event.position())
++
++    def mouseMoveEvent(self, event) -> None:
++        if self._drag is not None:
++            self._applyDrag(event.position())
++            return
++        hit = self._hitTest(event.position())
++        if hit != self._hover:
++            self._hover = hit
++            self.setCursor(QtCore.Qt.SizeHorCursor if hit and hit[0] == 'b'
++                           else QtCore.Qt.SizeVerCursor if hit else QtCore.Qt.CrossCursor)
++            self.update()
++
++    def mouseReleaseEvent(self, event) -> None:
++        self._drag = None
++
++    def leaveEvent(self, event) -> None:
++        self._hover = None
++        self.update()
++
++    def _applyDrag(self, pos: QtCore.QPointF) -> None:
++        kind, idx = self._drag
++        if kind == 'b':
++            target = int(round(self._tempForX(pos.x())))
++            self._curve.setBoundary(idx, target - self._curve.bias)
++        else:
++            raw = self._speedForY(pos.y())
++            snapped = int(round(raw / self.SPEED_SNAP) * self.SPEED_SNAP)
++            self._curve.setSpeed(idx, snapped)
++        self.update()
++        self.curveChanged.emit()
+diff -ruN tcc-g15-master/src/GUI/FanCurve.py zh-src/src/GUI/FanCurve.py
+--- tcc-g15-master/src/GUI/FanCurve.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/GUI/FanCurve.py	2026-11-01 18:36:34.539772400 +0900
+@@ -0,0 +1,165 @@
++"""
++风扇曲线数据模型。
++
++曲线是「阶梯型」的：给定 N 个温度边界，把 40~100°C 切成 N+1 段，
++每一段一个固定风扇百分比。语义与上游 SILENT_CURVE 一致：
++
++    boundaries = [82, 87, 91]
++    speeds     = [0, 30, 65, 100]
++
++    temp <  82        -> 0%
++    82 <= temp <  87  -> 30%
++    87 <= temp <  91  -> 65%
++    temp >= 91        -> 100%
++
++额外支持一个「噪音偏移」(bias)：把整条曲线的温度边界统一平移，
++让用户只拖一根「安静 ↔ 凉快」的滑块就能微调整体倾向，而不必改每一档。
++"""
++
++import json
++from typing import List, Optional, Tuple
++
++TEMP_MIN = 40
++TEMP_MAX = 100
++SPEED_MIN = 0
++SPEED_MAX = 100
++MIN_GAP = 2          # 相邻温度边界的最小间隔（°C）
++BIAS_LIMIT = 8       # 噪音偏移的上下限（°C）
++
++DEFAULT_BOUNDARIES = [82, 87, 91]
++DEFAULT_SPEEDS = [0, 30, 65, 100]
++
++
++def _normalizeSequence(values: List[int], lo: int, hi: int, gap: int) -> List[int]:
++    """夹取到 [lo, hi]、保证严格递增且相邻间隔 >= gap。
++
++    先做正向推挤，再做反向修正——只做正向会把末尾顶出上界，
++    例如 [200] 夹成 98 后推挤成 [98, 100, 102]。
++    """
++    out = [max(lo, min(hi, int(v))) for v in values]
++    for i in range(1, len(out)):
++        if out[i] < out[i - 1] + gap:
++            out[i] = out[i - 1] + gap
++    if out and out[-1] > hi:
++        out[-1] = hi
++        for i in range(len(out) - 2, -1, -1):
++            if out[i] > out[i + 1] - gap:
++                out[i] = out[i + 1] - gap
++    return [max(lo, v) for v in out]
++
++
++class FanCurve:
++    def __init__(self, boundaries: Optional[List[int]] = None,
++                 speeds: Optional[List[int]] = None, bias: int = 0) -> None:
++        if boundaries is None:
++            boundaries = list(DEFAULT_BOUNDARIES)
++        if speeds is None:
++            speeds = list(DEFAULT_SPEEDS)
++        self.boundaries: List[int] = [int(b) for b in boundaries]
++        self.speeds: List[int] = [int(s) for s in speeds]
++        self.bias: int = int(bias)
++        if len(self.speeds) != len(self.boundaries) + 1:
++            raise ValueError("speeds 必须比 boundaries 多一个元素")
++        self.normalize()
++
++    # ---------- 构造 ----------
++
++    @classmethod
++    def default(cls) -> "FanCurve":
++        return cls()
++
++    @classmethod
++    def fromJson(cls, raw) -> "FanCurve":
++        """从 QSettings 里取出的 JSON 字符串还原；任何异常都退回默认值"""
++        try:
++            d = json.loads(raw) if isinstance(raw, str) else dict(raw)
++            return cls(d["b"], d["s"], d.get("bias", 0))
++        except Exception:
++            return cls()
++
++    def toJson(self) -> str:
++        return json.dumps({"b": self.boundaries, "s": self.speeds, "bias": self.bias},
++                          ensure_ascii=False)
++
++    def copy(self) -> "FanCurve":
++        return FanCurve(self.boundaries, self.speeds, self.bias)
++
++    # ---------- 规范化 ----------
++
++    def normalize(self) -> None:
++        """把边界夹到合法区间、保证严格递增且间隔达标、转速夹到 0~100"""
++        self.bias = max(-BIAS_LIMIT, min(BIAS_LIMIT, int(self.bias)))
++        self.boundaries = _normalizeSequence(self.boundaries,
++                                            TEMP_MIN + MIN_GAP, TEMP_MAX - MIN_GAP, MIN_GAP)
++        self.speeds = [max(SPEED_MIN, min(SPEED_MAX, int(s))) for s in self.speeds]
++
++    # ---------- 求值 ----------
++
++    def effectiveBoundaries(self) -> List[int]:
++        """叠加噪音偏移后的实际边界。偏移后仍需保持递增，否则逐项兜住。"""
++        return _normalizeSequence([b + self.bias for b in self.boundaries],
++                                  TEMP_MIN + MIN_GAP, TEMP_MAX - MIN_GAP, MIN_GAP)
++
++    def bandIndex(self, temp: Optional[int]) -> int:
++        """温度落在第几档。读不到温度时按最高档处理，宁可吵不可热"""
++        if temp is None:
++            return len(self.speeds) - 1
++        for i, b in enumerate(self.effectiveBoundaries()):
++            if temp < b:
++                return i
++        return len(self.speeds) - 1
++
++    def speedAt(self, temp: Optional[int]) -> int:
++        return self.speeds[self.bandIndex(temp)]
++
++    def bandLowerEdge(self, index: int) -> int:
++        """第 index 档的下界温度（用于降档滞环判断）"""
++        if index <= 0:
++            return -1000
++        return self.effectiveBoundaries()[index - 1]
++
++    def levelRanges(self) -> List[Tuple[str, int]]:
++        """给界面/提示文本用的 (温度描述, 转速) 列表"""
++        eb = self.effectiveBoundaries()
++        out: List[Tuple[str, int]] = []
++        for i, spd in enumerate(self.speeds):
++            if i == 0:
++                desc = f"< {eb[0]}°C"
++            elif i == len(self.speeds) - 1:
++                desc = f"≥ {eb[-1]}°C"
++            else:
++                desc = f"{eb[i-1]}~{eb[i]}°C"
++            out.append((desc, spd))
++        return out
++
++    def describe(self) -> str:
++        return "　".join(f"{d}·{s}%" for d, s in self.levelRanges())
++
++    # ---------- 修改 ----------
++
++    def setBoundary(self, index: int, value: int) -> None:
++        if 0 <= index < len(self.boundaries):
++            self.boundaries[index] = int(value)
++            self.normalize()
++
++    def setSpeed(self, index: int, value: int) -> None:
++        if 0 <= index < len(self.speeds):
++            self.speeds[index] = int(value)
++            self.normalize()
++
++    def setBias(self, value: int) -> None:
++        self.bias = int(value)
++        self.normalize()
++
++    def reset(self) -> None:
++        self.boundaries = list(DEFAULT_BOUNDARIES)
++        self.speeds = list(DEFAULT_SPEEDS)
++        self.bias = 0
++        self.normalize()
++
++    def __eq__(self, other) -> bool:
++        if not isinstance(other, FanCurve):
++            return NotImplemented
++        return (self.boundaries == other.boundaries and
++                self.speeds == other.speeds and
++                self.bias == other.bias)
+diff -ruN tcc-g15-master/src/GUI/HistoryChartWidget.py zh-src/src/GUI/HistoryChartWidget.py
+--- tcc-g15-master/src/GUI/HistoryChartWidget.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/GUI/HistoryChartWidget.py	2026-11-01 18:50:30.052102400 +0900
+@@ -0,0 +1,159 @@
++"""
++温度 / 转速历史记录。
++
++拆成两部分：
++- HistoryBuffer：只管存数据，主界面每秒往里塞一个采样点，与界面是否可见无关
++- HistoryChartWidget：只负责画，从 buffer 里读
++
++这样设置窗口关掉再打开不会丢历史，也不用在对话框里定时采样。
++用 QPainter 直接画折线，不引 QtCharts（那会多十几 MB 打包体积）。
++"""
++
++import collections
++import csv
++import time
++from typing import Deque, List, Optional, Tuple
++
++from PySide6 import QtCore, QtGui, QtWidgets
++
++from GUI.AppColors import Colors
++
++Sample = Tuple[float, Optional[int], Optional[int], Optional[int], Optional[int]]
++
++
++class HistoryBuffer:
++    def __init__(self, capacity: int = 1800) -> None:
++        self.capacity = capacity
++        self.samples: Deque[Sample] = collections.deque(maxlen=capacity)
++
++    def add(self, gpuTemp: Optional[int], cpuTemp: Optional[int],
++            gpuRpm: Optional[int], cpuRpm: Optional[int]) -> None:
++        self.samples.append((time.time(), gpuTemp, cpuTemp, gpuRpm, cpuRpm))
++
++    def clear(self) -> None:
++        self.samples.clear()
++
++    def __len__(self) -> int:
++        return len(self.samples)
++
++    def exportCsv(self, path: str) -> int:
++        with open(path, "w", encoding="utf-8-sig", newline="") as f:
++            w = csv.writer(f)
++            w.writerow(["时间", "GPU温度(°C)", "CPU温度(°C)", "GPU转速(RPM)", "CPU转速(RPM)"])
++            for ts, gt, ct, gr, cr in self.samples:
++                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
++                            gt if gt is not None else "",
++                            ct if ct is not None else "",
++                            gr if gr is not None else "",
++                            cr if cr is not None else ""])
++        return len(self.samples)
++
++
++class HistoryChartWidget(QtWidgets.QWidget):
++    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 42, 52, 22, 28
++    MAX_TEMP = 105
++    MAX_RPM = 6000
++
++    def __init__(self, buffer: HistoryBuffer,
++                 parent: Optional[QtWidgets.QWidget] = None) -> None:
++        super().__init__(parent)
++        self._buf = buffer
++        self.setMinimumSize(460, 190)
++        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
++
++    def refresh(self) -> None:
++        self.update()
++
++    def _plotRect(self) -> QtCore.QRectF:
++        return QtCore.QRectF(
++            self.MARGIN_L, self.MARGIN_T,
++            max(1.0, self.width() - self.MARGIN_L - self.MARGIN_R),
++            max(1.0, self.height() - self.MARGIN_T - self.MARGIN_B),
++        )
++
++    def paintEvent(self, event) -> None:
++        p = QtGui.QPainter(self)
++        p.setRenderHint(QtGui.QPainter.Antialiasing)
++        r = self._plotRect()
++
++        p.fillRect(self.rect(), QtGui.QColor(Colors.DARK_GREY.value))
++        p.fillRect(r, QtGui.QColor('#171717'))
++
++        p.setFont(QtGui.QFont('Microsoft YaHei UI', 8))
++
++        gridPen = QtGui.QPen(QtGui.QColor('#2e2e2e'))
++        gridPen.setWidthF(1.0)
++        labelPen = QtGui.QPen(QtGui.QColor(Colors.GREY.value))
++
++        for t in range(0, self.MAX_TEMP + 1, 20):
++            y = r.bottom() - t / self.MAX_TEMP * r.height()
++            p.setPen(gridPen)
++            p.drawLine(QtCore.QPointF(r.left(), y), QtCore.QPointF(r.right(), y))
++            p.setPen(labelPen)
++            p.drawText(QtCore.QRectF(2, y - 8, self.MARGIN_L - 8, 16),
++                       QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{t}°")
++        for rpm in range(0, self.MAX_RPM + 1, 1500):
++            y = r.bottom() - rpm / self.MAX_RPM * r.height()
++            p.setPen(labelPen)
++            p.drawText(QtCore.QRectF(r.right() + 4, y - 8, self.MARGIN_R - 6, 16),
++                       QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, f"{rpm}")
++
++        samples = self._buf.samples
++        if len(samples) < 2:
++            p.setPen(labelPen)
++            p.drawText(r, QtCore.Qt.AlignCenter, "正在采集数据…")
++            p.end()
++            return
++
++        count = len(samples)
++
++        def xAt(index: int) -> float:
++            # 按当前已有样本数铺满宽度；缓冲区满了以后自然变成滑动窗口。
++            # 早期样本少时如果按 capacity 映射，曲线会挤在最右边看不出东西。
++            denom = max(count - 1, 1)
++            return r.left() + index / denom * r.width()
++
++        gpuColor = QtGui.QColor(Colors.GREEN.value)
++        cpuColor = QtGui.QColor(Colors.YELLOW.value)
++
++        def drawSeries(getter, color, maxVal, width, alpha, dashed=False):
++            col = QtGui.QColor(color)
++            col.setAlpha(alpha)
++            pen = QtGui.QPen(col)
++            pen.setWidthF(width)
++            if dashed:
++                pen.setStyle(QtCore.Qt.DashLine)
++            p.setPen(pen)
++            prev = None
++            for i, s in enumerate(samples):
++                v = getter(s)
++                if v is None:
++                    prev = None
++                    continue
++                cur = QtCore.QPointF(xAt(i), r.bottom() - v / maxVal * r.height())
++                if prev is not None:
++                    p.drawLine(prev, cur)
++                prev = cur
++
++        drawSeries(lambda s: s[3], gpuColor, self.MAX_RPM, 1.2, 110)
++        drawSeries(lambda s: s[4], cpuColor, self.MAX_RPM, 1.2, 110)
++        drawSeries(lambda s: s[1], gpuColor, self.MAX_TEMP, 2.0, 255)
++        drawSeries(lambda s: s[2], cpuColor, self.MAX_TEMP, 2.0, 255)
++
++        legend = [("GPU 温度", gpuColor, 255), ("CPU 温度", cpuColor, 255),
++                  ("GPU 转速", gpuColor, 110), ("CPU 转速", cpuColor, 110)]
++        x = r.left() + 8
++        for text, color, alpha in legend:
++            col = QtGui.QColor(color)
++            col.setAlpha(alpha)
++            p.setPen(QtGui.QPen(col, 2.0))
++            p.drawLine(QtCore.QPointF(x, r.top() - 12), QtCore.QPointF(x + 14, r.top() - 12))
++            p.setPen(QtGui.QPen(QtGui.QColor(Colors.WHITE.value)))
++            p.drawText(QtCore.QRectF(x + 18, r.top() - 20, 72, 16), QtCore.Qt.AlignLeft, text)
++            x += 88
++
++        span = int(samples[-1][0] - samples[0][0])
++        p.setPen(labelPen)
++        p.drawText(QtCore.QRectF(r.left(), r.bottom() + 6, r.width(), 16),
++                   QtCore.Qt.AlignCenter, f"最近 {span} 秒 · {count} 个采样")
++        p.end()
 diff -ruN tcc-g15-master/src/GUI/QRadioButtonSet.py zh-src/src/GUI/QRadioButtonSet.py
 --- tcc-g15-master/src/GUI/QRadioButtonSet.py	2026-10-23 18:53:08.323395700 +0900
 +++ zh-src/src/GUI/QRadioButtonSet.py	2026-11-01 16:02:48.029720300 +0900
@@ -390,6 +1461,443 @@ diff -ruN tcc-g15-master/src/GUI/QRadioButtonSet.py zh-src/src/GUI/QRadioButtonS
      @QtCore.Slot()
      def _onClicked(self):
          rb = self.sender() # type: QtWidgets.QRadioButton
+diff -ruN tcc-g15-master/src/GUI/SettingsDialog.py zh-src/src/GUI/SettingsDialog.py
+--- tcc-g15-master/src/GUI/SettingsDialog.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/GUI/SettingsDialog.py	2026-11-01 18:51:42.910828900 +0900
+@@ -0,0 +1,406 @@
++"""设置对话框：风扇曲线 / 自动化 / 诊断。"""
++
++from typing import Callable, List, Optional, Tuple
++
++from PySide6 import QtCore, QtGui, QtWidgets
++
++from Backend.GameDetector import DEFAULT_EXCLUSIONS
++from GUI.AppColors import Colors
++from GUI.CurveEditorWidget import CurveEditorWidget
++from GUI.FanCurve import FanCurve, BIAS_LIMIT
++from GUI.HistoryChartWidget import HistoryBuffer, HistoryChartWidget
++from GUI.SettingsKeys import SettingsKey
++
++
++def vkName(vk: int) -> str:
++    if 0x41 <= vk <= 0x5A:
++        return chr(vk)
++    if 0x30 <= vk <= 0x39:
++        return chr(vk)
++    if 0x70 <= vk <= 0x87:
++        return f"F{vk - 0x70 + 1}"
++    return f"0x{vk:02X}"
++
++
++def qtKeyToVk(key: int) -> Optional[int]:
++    if QtCore.Qt.Key_A <= key <= QtCore.Qt.Key_Z:
++        return key
++    if QtCore.Qt.Key_0 <= key <= QtCore.Qt.Key_9:
++        return key
++    if QtCore.Qt.Key_F1 <= key <= QtCore.Qt.Key_F35:
++        return 0x70 + (key - QtCore.Qt.Key_F1)
++    return None
++
++
++class HotKeyButton(QtWidgets.QPushButton):
++    """点一下进入“按键捕捉”状态，把按下的一次按键转成 Win32 虚拟键码"""
++
++    captured = QtCore.Signal(int)
++
++    def __init__(self, vk: int, parent: Optional[QtWidgets.QWidget] = None) -> None:
++        super().__init__(vkName(vk), parent)
++        self._capturing = False
++        self._idleText = vkName(vk)
++        self.setMinimumWidth(110)
++        self.clicked.connect(self._startCapture)
++
++    def setIdleVk(self, vk: int) -> None:
++        self._idleText = vkName(vk)
++        if not self._capturing:
++            self.setText(self._idleText)
++
++    def _startCapture(self) -> None:
++        self._capturing = True
++        self.setText("请按键…")
++        self.setFocus()
++
++    def keyPressEvent(self, event) -> None:
++        if not self._capturing:
++            super().keyPressEvent(event)
++            return
++        key = event.key()
++        if key == QtCore.Qt.Key_Escape:
++            self._capturing = False
++            self.setText(self._idleText)
++            return
++        vk = qtKeyToVk(key)
++        self._capturing = False
++        if vk is None:
++            self.setText("不支持，重试")
++            QtCore.QTimer.singleShot(1200, lambda: self.setText(self._idleText))
++            return
++        self._idleText = vkName(vk)
++        self.setText(self._idleText)
++        self.captured.emit(vk)
++
++
++class SettingsDialog(QtWidgets.QDialog):
++    curveChanged = QtCore.Signal()
++    automationChanged = QtCore.Signal()
++    hotKeyChanged = QtCore.Signal(int)
++
++    def __init__(self, curve: FanCurve, settings: QtCore.QSettings,
++                 history: HistoryBuffer,
++                 tempsProvider: Callable[[], Tuple[Optional[int], Optional[int]]],
++                 sensorScanner: Callable[[], List[Tuple[int, int]]],
++                 parent: Optional[QtWidgets.QWidget] = None) -> None:
++        super().__init__(parent)
++        self._curve = curve
++        self._settings = settings
++        self._history = history
++        self._tempsProvider = tempsProvider
++        self._sensorScanner = sensorScanner
++        self._sensorRows: Optional[List[Tuple[int, int]]] = None
++
++        self.setWindowTitle("设置")
++        self.setMinimumSize(740, 590)
++        self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
++
++        tabs = QtWidgets.QTabWidget()
++        tabs.addTab(self._buildCurveTab(), "风扇曲线")
++        tabs.addTab(self._buildAutomationTab(), "自动化")
++        tabs.addTab(self._buildDiagnosticsTab(), "诊断")
++
++        closeBtn = QtWidgets.QPushButton("关闭")
++        closeBtn.clicked.connect(self.close)
++        bottom = QtWidgets.QHBoxLayout()
++        bottom.addStretch(1)
++        bottom.addWidget(closeBtn)
++
++        layout = QtWidgets.QVBoxLayout(self)
++        layout.addWidget(tabs)
++        layout.addLayout(bottom)
++
++        self._liveTimer = QtCore.QTimer(self)
++        self._liveTimer.setInterval(1000)
++        self._liveTimer.timeout.connect(self._refreshLive)
++        self._liveTimer.start()
++        self._refreshLive()
++        # 让窗口先画出来，再跑阻塞式的传感器扫描
++        QtCore.QTimer.singleShot(150, self._runSensorScan)
++
++    # ================= 风扇曲线 =================
++
++    def _buildCurveTab(self) -> QtWidgets.QWidget:
++        page = QtWidgets.QWidget()
++        layout = QtWidgets.QVBoxLayout(page)
++
++        hint = QtWidgets.QLabel(
++            "只在「静音模式」下生效。拖动竖线改温度阈值，拖动圆点改该档转速；"
++            "绿色 / 黄色虚线是当前 GPU / CPU 实测温度。")
++        hint.setWordWrap(True)
++        hint.setStyleSheet(f"color: {Colors.GREY.value};")
++        layout.addWidget(hint)
++
++        self._editor = CurveEditorWidget(self._curve)
++        self._editor.curveChanged.connect(self._onCurveEdited)
++        layout.addWidget(self._editor, 1)
++
++        self._curveDesc = QtWidgets.QLabel()
++        self._curveDesc.setStyleSheet(f"color: {Colors.WHITE.value};")
++        layout.addWidget(self._curveDesc)
++
++        sliderRow = QtWidgets.QHBoxLayout()
++        sliderRow.addWidget(QtWidgets.QLabel("更安静"))
++        self._biasSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
++        self._biasSlider.setRange(0, BIAS_LIMIT * 2)
++        self._biasSlider.setSingleStep(1)
++        self._biasSlider.setPageStep(2)
++        self._biasSlider.setTickPosition(QtWidgets.QSlider.TicksBelow)
++        self._biasSlider.setTickInterval(4)
++        self._biasSlider.valueChanged.connect(self._onBiasChanged)
++        sliderRow.addWidget(self._biasSlider, 1)
++        sliderRow.addWidget(QtWidgets.QLabel("更凉快"))
++        layout.addLayout(sliderRow)
++
++        self._biasLabel = QtWidgets.QLabel()
++        self._biasLabel.setStyleSheet(f"color: {Colors.GREY.value};")
++        layout.addWidget(self._biasLabel)
++
++        resetBtn = QtWidgets.QPushButton("恢复默认曲线")
++        resetBtn.clicked.connect(self._onResetCurve)
++        row = QtWidgets.QHBoxLayout()
++        row.addStretch(1)
++        row.addWidget(resetBtn)
++        layout.addLayout(row)
++
++        self._syncCurveUi()
++        return page
++
++    def _syncCurveUi(self) -> None:
++        self._curveDesc.setText("当前曲线：" + self._curve.describe())
++        # 滑块 0..2*BIAS_LIMIT 反向映射：左端最安静（bias 为正，阈值上移）
++        self._biasSlider.blockSignals(True)
++        self._biasSlider.setValue(BIAS_LIMIT - self._curve.bias)
++        self._biasSlider.blockSignals(False)
++        if self._curve.bias == 0:
++            self._biasLabel.setText("整体偏移：0°C")
++        elif self._curve.bias > 0:
++            self._biasLabel.setText(f"整体偏移：+{self._curve.bias}°C（更晚提速，更安静）")
++        else:
++            self._biasLabel.setText(f"整体偏移：{self._curve.bias}°C（更早提速，更凉快）")
++
++    def _onBiasChanged(self, value: int) -> None:
++        self._curve.setBias(BIAS_LIMIT - value)
++        self._syncCurveUi()
++        self._editor.update()
++        self.curveChanged.emit()
++
++    def _onCurveEdited(self) -> None:
++        self._syncCurveUi()
++        self.curveChanged.emit()
++
++    def _onResetCurve(self) -> None:
++        self._curve.reset()
++        self._syncCurveUi()
++        self._editor.update()
++        self.curveChanged.emit()
++
++    def _refreshLive(self) -> None:
++        gpu, cpu = self._tempsProvider()
++        self._editor.setLiveTemps(gpu, cpu)
++
++    # ================= 自动化 =================
++
++    def _buildAutomationTab(self) -> QtWidgets.QWidget:
++        page = QtWidgets.QWidget()
++        layout = QtWidgets.QVBoxLayout(page)
++
++        def section(text: str) -> QtWidgets.QLabel:
++            lb = QtWidgets.QLabel(text)
++            f = lb.font()
++            f.setBold(True)
++            lb.setFont(f)
++            return lb
++
++        def note(text: str) -> QtWidgets.QLabel:
++            lb = QtWidgets.QLabel(text)
++            lb.setWordWrap(True)
++            lb.setStyleSheet(f"color: {Colors.GREY.value};")
++            return lb
++
++        layout.addWidget(section("电源联动"))
++        self._powerLinkCB = QtWidgets.QCheckBox("根据供电状态自动切换模式")
++        self._powerLinkCB.setChecked(self._getBool(SettingsKey.PowerLinkFlag, False))
++        self._powerLinkCB.toggled.connect(self._saveAutomation)
++        layout.addWidget(self._powerLinkCB)
++
++        row = QtWidgets.QHBoxLayout()
++        row.addWidget(QtWidgets.QLabel("使用电池时切到"))
++        self._batteryModeCombo = QtWidgets.QComboBox()
++        self._batteryModeCombo.addItems(["静音模式", "平衡模式", "G 模式"])
++        self._batteryModeCombo.setCurrentIndex(
++            int(self._settings.value(SettingsKey.PowerLinkBatteryMode.value) or 0))
++        self._batteryModeCombo.currentIndexChanged.connect(self._saveAutomation)
++        row.addWidget(self._batteryModeCombo)
++        row.addStretch(1)
++        layout.addLayout(row)
++        layout.addWidget(note("插上电源时自动切回平衡模式。手动切换模式后，自动化会等到下一次供电状态变化才再动手。"))
++
++        line = QtWidgets.QFrame()
++        line.setFrameShape(QtWidgets.QFrame.HLine)
++        line.setStyleSheet(f"color: {Colors.GREY.value};")
++        layout.addWidget(line)
++
++        layout.addWidget(section("游戏检测"))
++        self._gameDetectCB = QtWidgets.QCheckBox("检测到全屏游戏时自动切到 G 模式")
++        self._gameDetectCB.setChecked(self._getBool(SettingsKey.GameDetectFlag, False))
++        self._gameDetectCB.toggled.connect(self._saveAutomation)
++        layout.addWidget(self._gameDetectCB)
++        layout.addWidget(note(
++            "判定方式是「前台窗口铺满整个屏幕，且进程不在下面的排除表里」——"
++            "Dell 的接口不告诉我们当前跑的是什么程序，只能这样猜。"
++            "浏览器按 F11 全屏、视频播放器全屏都会被误判，把它们的进程名加进排除表即可。"))
++        self._exclusionsEdit = QtWidgets.QPlainTextEdit()
++        self._exclusionsEdit.setPlaceholderText("每行一个进程名，例如：chrome")
++        self._exclusionsEdit.setMaximumHeight(96)
++        savedExcl = self._settings.value(SettingsKey.GameExclusions.value)
++        self._exclusionsEdit.setPlainText(str(savedExcl) if savedExcl else "\n".join(DEFAULT_EXCLUSIONS))
++        self._exclusionsEdit.textChanged.connect(self._saveAutomation)
++        layout.addWidget(self._exclusionsEdit)
++
++        line2 = QtWidgets.QFrame()
++        line2.setFrameShape(QtWidgets.QFrame.HLine)
++        line2.setStyleSheet(f"color: {Colors.GREY.value};")
++        layout.addWidget(line2)
++
++        layout.addWidget(section("全局热键"))
++        hkRow = QtWidgets.QHBoxLayout()
++        hkRow.addWidget(QtWidgets.QLabel("G 模式切换键："))
++        curVk = int(self._settings.value(SettingsKey.HotKeyVk.value) or 0x80)
++        self._hotKeyBtn = HotKeyButton(curVk)
++        self._hotKeyBtn.captured.connect(self._onHotKeyCaptured)
++        hkRow.addWidget(self._hotKeyBtn)
++        hkRow.addStretch(1)
++        layout.addLayout(hkRow)
++        layout.addWidget(note("点一下按钮，然后按下想用的键。只支持单个按键（字母、数字、F1~F24），不支持组合键。改完立即生效。"))
++
++        layout.addStretch(1)
++        return page
++
++    def _getBool(self, key: SettingsKey, default: bool) -> bool:
++        v = self._settings.value(key.value)
++        if v is None:
++            return default
++        return str(v).lower() == "true"
++
++    def _saveAutomation(self) -> None:
++        self._settings.setValue(SettingsKey.PowerLinkFlag.value, self._powerLinkCB.isChecked())
++        self._settings.setValue(SettingsKey.PowerLinkBatteryMode.value, self._batteryModeCombo.currentIndex())
++        self._settings.setValue(SettingsKey.GameDetectFlag.value, self._gameDetectCB.isChecked())
++        self._settings.setValue(SettingsKey.GameExclusions.value, self._exclusionsEdit.toPlainText())
++        self._settings.sync()
++        self.automationChanged.emit()
++
++    def _onHotKeyCaptured(self, vk: int) -> None:
++        self._settings.setValue(SettingsKey.HotKeyVk.value, vk)
++        self._settings.sync()
++        self.hotKeyChanged.emit(vk)
++
++    def exclusions(self) -> List[str]:
++        raw = self._exclusionsEdit.toPlainText().replace(",", "\n")
++        return [x.strip().lower() for x in raw.splitlines() if x.strip()]
++
++    # ================= 诊断 =================
++
++    def _buildDiagnosticsTab(self) -> QtWidgets.QWidget:
++        page = QtWidgets.QWidget()
++        layout = QtWidgets.QVBoxLayout(page)
++
++        layout.addWidget(QtWidgets.QLabel("温度与转速历史"))
++        self._chart = HistoryChartWidget(self._history)
++        layout.addWidget(self._chart, 1)
++
++        btnRow = QtWidgets.QHBoxLayout()
++        exportBtn = QtWidgets.QPushButton("导出 CSV")
++        exportBtn.clicked.connect(self._onExportCsv)
++        clearBtn = QtWidgets.QPushButton("清空历史")
++        clearBtn.clicked.connect(self._onClearHistory)
++        btnRow.addStretch(1)
++        btnRow.addWidget(exportBtn)
++        btnRow.addWidget(clearBtn)
++        layout.addLayout(btnRow)
++
++        self._csvHint = QtWidgets.QLabel("")
++        self._csvHint.setStyleSheet(f"color: {Colors.GREY.value};")
++        layout.addWidget(self._csvHint)
++
++        line = QtWidgets.QFrame()
++        line.setFrameShape(QtWidgets.QFrame.HLine)
++        line.setStyleSheet(f"color: {Colors.GREY.value};")
++        layout.addWidget(line)
++
++        headRow = QtWidgets.QHBoxLayout()
++        headRow.addWidget(QtWidgets.QLabel("传感器"))
++        self._scanBtn = QtWidgets.QPushButton("重新扫描")
++        self._scanBtn.clicked.connect(self._runSensorScan)
++        headRow.addStretch(1)
++        headRow.addWidget(self._scanBtn)
++        layout.addLayout(headRow)
++
++        self._sensorTable = QtWidgets.QTableWidget(0, 3)
++        self._sensorTable.setHorizontalHeaderLabels(["编号", "温度", "说明"])
++        self._sensorTable.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
++        self._sensorTable.verticalHeader().setVisible(False)
++        self._sensorTable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
++        self._sensorTable.setMaximumHeight(150)
++        layout.addWidget(self._sensorTable)
++
++        layout.addWidget(QtWidgets.QLabel(
++            "说明：编号是 Dell WMI 的传感器 ID。标着「风扇关联」的是界面主视图用的那两路；"
++            "其余是驱动里有读数、但没有绑定到风扇的传感器。"))
++
++        self._chartTimer = QtCore.QTimer(self)
++        self._chartTimer.setInterval(1000)
++        self._chartTimer.timeout.connect(self._chart.refresh)
++        self._chartTimer.start()
++        return page
++
++    def _runSensorScan(self) -> None:
++        """同步扫描。WMI 的 COM 对象是在主线程创建的，放到别的线程调用会直接失败，
++        所以这里不走线程——13 个传感器大约 1 秒，比拿不到数据好。"""
++        self._scanBtn.setEnabled(False)
++        self._scanBtn.setText("扫描中…")
++        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
++        try:
++            self._sensorRows = self._sensorScanner()
++        except Exception:
++            self._sensorRows = []
++        finally:
++            QtWidgets.QApplication.restoreOverrideCursor()
++            self._scanBtn.setEnabled(True)
++            self._scanBtn.setText("重新扫描")
++        self._populateSensorTable()
++
++    def _populateSensorTable(self) -> None:
++        rows = self._sensorRows or []
++        known = {1: "CPU（风扇关联）", 6: "GPU（风扇关联）"}
++        self._sensorTable.setRowCount(len(rows))
++        for r, (sid, temp) in enumerate(sorted(rows)):
++            self._sensorTable.setItem(r, 0, QtWidgets.QTableWidgetItem(f"#{sid}"))
++            self._sensorTable.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{temp} °C"))
++            self._sensorTable.setItem(r, 2, QtWidgets.QTableWidgetItem(known.get(sid, "未关联风扇")))
++
++    def _onExportCsv(self) -> None:
++        defaultName = QtCore.QDateTime.currentDateTime().toString("yyyyMMdd-HHmmss")
++        path, _ = QtWidgets.QFileDialog.getSaveFileName(
++            self, "导出历史记录", f"tcc-history-{defaultName}.csv", "CSV 文件 (*.csv)")
++        if not path:
++            return
++        try:
++            n = self._history.exportCsv(path)
++            self._csvHint.setText(f"已导出 {n} 条记录")
++        except Exception as ex:
++            self._csvHint.setText(f"导出失败：{ex}")
++
++    def _onClearHistory(self) -> None:
++        self._history.clear()
++        self._chart.refresh()
++        self._csvHint.setText("历史已清空")
++
++    # ================= 生命周期 =================
++
++    def closeEvent(self, event) -> None:
++        self._liveTimer.stop()
++        self._chartTimer.stop()
++        super().closeEvent(event)
+diff -ruN tcc-g15-master/src/GUI/SettingsKeys.py zh-src/src/GUI/SettingsKeys.py
+--- tcc-g15-master/src/GUI/SettingsKeys.py	1970-01-01 09:00:00.000000000 +0900
++++ zh-src/src/GUI/SettingsKeys.py	2026-11-01 18:39:43.295942600 +0900
+@@ -0,0 +1,23 @@
++"""QSettings 键名集中定义，主界面和设置对话框共用，避免两边写错字符串。"""
++
++from enum import Enum
++
++
++class SettingsKey(Enum):
++    # 主界面
++    Mode = "app/mode"
++    CPUFanSpeed = "app/fan/cpu/speed"
++    CPUThresholdTemp = "app/fan/cpu/threshold_temp"
++    GPUFanSpeed = "app/fan/gpu/speed"
++    GPUThresholdTemp = "app/fan/gpu/threshold_temp"
++    FailSafeIsOnFlag = "app/failsafe_is_on_flag"
++    MinimizeOnCloseFlag = "app/minimize_on_close_flag"
++    # 静音曲线
++    SilentCurveJson = "app/silent/curve_json"
++    # 自动化
++    PowerLinkFlag = "app/auto/power_link"
++    PowerLinkBatteryMode = "app/auto/power_link_battery_mode"
++    GameDetectFlag = "app/auto/game_detect"
++    GameExclusions = "app/auto/game_exclusions"
++    # 热键
++    HotKeyVk = "app/hotkey/vk"
 diff -ruN tcc-g15-master/src/GUI/ThermalUnitWidget.py zh-src/src/GUI/ThermalUnitWidget.py
 --- tcc-g15-master/src/GUI/ThermalUnitWidget.py	2026-10-23 18:53:08.325390500 +0900
 +++ zh-src/src/GUI/ThermalUnitWidget.py	2026-11-01 16:02:48.174600100 +0900
@@ -426,10 +1934,15 @@ diff -ruN tcc-g15-master/src/GUI/ThermalUnitWidget.py zh-src/src/GUI/ThermalUnit
          if self._speedSliderCallback:
 Binary files tcc-g15-master/src/GUI/__pycache__/AppColors.cpython-313.pyc and zh-src/src/GUI/__pycache__/AppColors.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/__pycache__/AppGUI.cpython-313.pyc and zh-src/src/GUI/__pycache__/AppGUI.cpython-313.pyc differ
+Binary files tcc-g15-master/src/GUI/__pycache__/CurveEditorWidget.cpython-313.pyc and zh-src/src/GUI/__pycache__/CurveEditorWidget.cpython-313.pyc differ
+Binary files tcc-g15-master/src/GUI/__pycache__/FanCurve.cpython-313.pyc and zh-src/src/GUI/__pycache__/FanCurve.cpython-313.pyc differ
+Binary files tcc-g15-master/src/GUI/__pycache__/HistoryChartWidget.cpython-313.pyc and zh-src/src/GUI/__pycache__/HistoryChartWidget.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/__pycache__/HotKey.cpython-313.pyc and zh-src/src/GUI/__pycache__/HotKey.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/__pycache__/QGauge.cpython-313.pyc and zh-src/src/GUI/__pycache__/QGauge.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/__pycache__/QGaugeTrayIcon.cpython-313.pyc and zh-src/src/GUI/__pycache__/QGaugeTrayIcon.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/__pycache__/QRadioButtonSet.cpython-313.pyc and zh-src/src/GUI/__pycache__/QRadioButtonSet.cpython-313.pyc differ
+Binary files tcc-g15-master/src/GUI/__pycache__/SettingsDialog.cpython-313.pyc and zh-src/src/GUI/__pycache__/SettingsDialog.cpython-313.pyc differ
+Binary files tcc-g15-master/src/GUI/__pycache__/SettingsKeys.cpython-313.pyc and zh-src/src/GUI/__pycache__/SettingsKeys.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/__pycache__/ThermalUnitWidget.cpython-313.pyc and zh-src/src/GUI/__pycache__/ThermalUnitWidget.cpython-313.pyc differ
 Binary files tcc-g15-master/src/GUI/translations/qtbase_zh_CN.qm and zh-src/src/GUI/translations/qtbase_zh_CN.qm differ
 Binary files tcc-g15-master/src/__pycache__/tcc-g15.cpython-313.pyc and zh-src/src/__pycache__/tcc-g15.cpython-313.pyc differ

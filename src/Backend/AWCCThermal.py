@@ -64,3 +64,19 @@ class AWCCThermal:
 
     def setMode(self, mode: ModeType) -> bool:
         return self._awcc.ApplyThermalMode(mode)
+
+    def probeSensors(self, maxId: int = 12) -> list:
+        """扫描 0..maxId 号传感器，返回有读数的 [(id, 温度)]。
+
+        用来发现没被 GetFanIdsAndRelatedSensorsIds 登记的隐藏传感器。
+        单个 ID 读取失败属正常情况，跳过即可。
+        """
+        found = []
+        for sensorId in range(0, maxId + 1):
+            try:
+                value = self._awcc.GetSensorTemperature(sensorId)
+            except Exception:
+                value = None
+            if value is not None:
+                found.append((sensorId, value))
+        return found
