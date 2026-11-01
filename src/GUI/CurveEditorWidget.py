@@ -4,6 +4,7 @@
 - 拖动竖直边界：调整温度阈值
 - 拖动线段上的圆点：调整该档的风扇百分比
 - 灰色竖线表示当前 GPU / CPU 实测温度，方便对着真实温度调参
+- 可选传入「另一条曲线」作为对照，用淡色虚线画出来，便于对比 GPU 与 CPU 的设定差异
 """
 
 from typing import Optional, Tuple
@@ -21,9 +22,11 @@ class CurveEditorWidget(QtWidgets.QWidget):
     HIT_RADIUS = 11
     SPEED_SNAP = 5
 
-    def __init__(self, curve: FanCurve, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(self, curve: FanCurve, secondary: Optional[FanCurve] = None,
+                 parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._curve = curve
+        self._secondary = secondary
         self._drag: Optional[Tuple[str, int]] = None
         self._liveTemps: Tuple[Optional[int], Optional[int]] = (None, None)
         self._hover: Optional[Tuple[str, int]] = None
@@ -36,10 +39,17 @@ class CurveEditorWidget(QtWidgets.QWidget):
 
     def setCurve(self, curve: FanCurve) -> None:
         self._curve = curve
+        self._drag = None
+        self._hover = None
         self.update()
 
     def curve(self) -> FanCurve:
         return self._curve
+
+    def setSecondaryCurve(self, curve: Optional[FanCurve]) -> None:
+        """设置对照曲线（淡色虚线），不参与编辑"""
+        self._secondary = curve
+        self.update()
 
     def setLiveTemps(self, gpu: Optional[int], cpu: Optional[int]) -> None:
         self._liveTemps = (gpu, cpu)
@@ -95,6 +105,18 @@ class CurveEditorWidget(QtWidgets.QWidget):
         for x0, x1, spd, i in segs:
             out.append(('s', i, (x0 + x1) / 2.0, self._yForSpeed(spd)))
         return out
+
+    def _drawRoleLegend(self, p: QtGui.QPainter, r: QtCore.QRectF,
+                        ghostColor: QtGui.QColor) -> None:
+        """右上角标注当前编辑的是哪条曲线"""
+        name = 'CPU 曲线' if self._curve.role == 'cpu' else 'GPU 曲线'
+        text = f"正在编辑：{name}"
+        if self._secondary is not None:
+            other = 'CPU' if self._curve.role == 'gpu' else 'GPU'
+            text += f"（虚线为 {other} 曲线）"
+        p.setPen(QtGui.QPen(QtGui.QColor(Colors.WHITE.value)))
+        p.drawText(QtCore.QRectF(r.right() - 260, r.top() - 14, 256, 14),
+                   QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, text)
 
     def _hitTest(self, pos: QtCore.QPointF):
         best = None
@@ -167,6 +189,30 @@ class CurveEditorWidget(QtWidgets.QWidget):
             x = self._xForTemp(b)
             p.drawLine(QtCore.QPointF(x, self._yForSpeed(segs[i][2])),
                        QtCore.QPointF(x, self._yForSpeed(segs[i + 1][2])))
+
+        # 对照曲线（另一颗芯片的设定），淡色虚线，只作参考不可拖
+        if self._secondary is not None:
+            eb2 = self._secondary.effectiveBoundaries()
+            sp2 = self._secondary.speeds
+            ghost = QtGui.QColor(Colors.YELLOW.value)
+            ghost.setAlpha(120)
+            ghostPen = QtGui.QPen(ghost)
+            ghostPen.setWidthF(1.4)
+            ghostPen.setStyle(QtCore.Qt.DashLine)
+            p.setPen(ghostPen)
+            for i, spd in enumerate(sp2):
+                t0 = TEMP_MIN if i == 0 else eb2[i - 1]
+                t1 = TEMP_MAX if i == len(sp2) - 1 else eb2[i]
+                y = self._yForSpeed(spd)
+                p.drawLine(QtCore.QPointF(self._xForTemp(t0), y),
+                           QtCore.QPointF(self._xForTemp(t1), y))
+            for i, b in enumerate(eb2):
+                x = self._xForTemp(b)
+                p.drawLine(QtCore.QPointF(x, self._yForSpeed(sp2[i])),
+                           QtCore.QPointF(x, self._yForSpeed(sp2[i + 1])))
+            self._drawRoleLegend(p, r, ghost)
+        else:
+            self._drawRoleLegend(p, r, QtGui.QColor(Colors.BLUE.value).lighter(160))
 
         # 实时温度标记
         colors = (QtGui.QColor(Colors.GREEN.value), QtGui.QColor(Colors.YELLOW.value))

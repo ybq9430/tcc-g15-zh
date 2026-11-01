@@ -14,6 +14,9 @@
 
 额外支持一个「噪音偏移」(bias)：把整条曲线的温度边界统一平移，
 让用户只拖一根「安静 ↔ 凉快」的滑块就能微调整体倾向，而不必改每一档。
+
+GPU 和 CPU 各用一条曲线：同一颗芯片的 CPU 温度基线通常比 GPU 高 6~10°C，
+若共用一条曲线，CPU 会长期顶在最高档把风扇拉满，静音效果直接被吃掉。
 """
 
 import json
@@ -26,8 +29,16 @@ SPEED_MAX = 100
 MIN_GAP = 2          # 相邻温度边界的最小间隔（°C）
 BIAS_LIMIT = 8       # 噪音偏移的上下限（°C）
 
-DEFAULT_BOUNDARIES = [82, 87, 91]
-DEFAULT_SPEEDS = [0, 30, 65, 100]
+# GPU：空载 45~55°C，游戏 70~80°C
+DEFAULT_GPU_BOUNDARIES = [82, 87, 91]
+DEFAULT_GPU_SPEEDS = [0, 30, 65, 100]
+# CPU：基线比 GPU 高，阈值整体上移，最高档压在温度保护阈值（95）之下
+DEFAULT_CPU_BOUNDARIES = [86, 90, 94]
+DEFAULT_CPU_SPEEDS = [0, 30, 65, 100]
+
+# 兼容旧名字（老版本共用一条曲线）
+DEFAULT_BOUNDARIES = DEFAULT_GPU_BOUNDARIES
+DEFAULT_SPEEDS = DEFAULT_GPU_SPEEDS
 
 
 def _normalizeSequence(values: List[int], lo: int, hi: int, gap: int) -> List[int]:
@@ -48,13 +59,23 @@ def _normalizeSequence(values: List[int], lo: int, hi: int, gap: int) -> List[in
     return [max(lo, v) for v in out]
 
 
+def defaultsFor(role: str) -> Tuple[List[int], List[int]]:
+    """按角色（'gpu' / 'cpu'）给出默认边界与转速"""
+    if role == 'cpu':
+        return list(DEFAULT_CPU_BOUNDARIES), list(DEFAULT_CPU_SPEEDS)
+    return list(DEFAULT_GPU_BOUNDARIES), list(DEFAULT_GPU_SPEEDS)
+
+
 class FanCurve:
     def __init__(self, boundaries: Optional[List[int]] = None,
-                 speeds: Optional[List[int]] = None, bias: int = 0) -> None:
+                 speeds: Optional[List[int]] = None, bias: int = 0,
+                 role: str = 'gpu') -> None:
+        self.role = role
+        dftB, dftS = defaultsFor(role)
         if boundaries is None:
-            boundaries = list(DEFAULT_BOUNDARIES)
+            boundaries = dftB
         if speeds is None:
-            speeds = list(DEFAULT_SPEEDS)
+            speeds = dftS
         self.boundaries: List[int] = [int(b) for b in boundaries]
         self.speeds: List[int] = [int(s) for s in speeds]
         self.bias: int = int(bias)
@@ -65,24 +86,24 @@ class FanCurve:
     # ---------- 构造 ----------
 
     @classmethod
-    def default(cls) -> "FanCurve":
-        return cls()
+    def default(cls, role: str = 'gpu') -> "FanCurve":
+        return cls(role=role)
 
     @classmethod
-    def fromJson(cls, raw) -> "FanCurve":
+    def fromJson(cls, raw, role: str = 'gpu') -> "FanCurve":
         """从 QSettings 里取出的 JSON 字符串还原；任何异常都退回默认值"""
         try:
             d = json.loads(raw) if isinstance(raw, str) else dict(raw)
-            return cls(d["b"], d["s"], d.get("bias", 0))
+            return cls(d["b"], d["s"], d.get("bias", 0), role)
         except Exception:
-            return cls()
+            return cls(role=role)
 
     def toJson(self) -> str:
         return json.dumps({"b": self.boundaries, "s": self.speeds, "bias": self.bias},
                           ensure_ascii=False)
 
     def copy(self) -> "FanCurve":
-        return FanCurve(self.boundaries, self.speeds, self.bias)
+        return FanCurve(self.boundaries, self.speeds, self.bias, self.role)
 
     # ---------- 规范化 ----------
 
@@ -152,8 +173,7 @@ class FanCurve:
         self.normalize()
 
     def reset(self) -> None:
-        self.boundaries = list(DEFAULT_BOUNDARIES)
-        self.speeds = list(DEFAULT_SPEEDS)
+        self.boundaries, self.speeds = defaultsFor(self.role)
         self.bias = 0
         self.normalize()
 

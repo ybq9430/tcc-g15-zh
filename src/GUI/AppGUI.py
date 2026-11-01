@@ -1,7 +1,7 @@
 import sys, os, time, datetime
 from enum import Enum
-from typing import Callable, Literal, Optional, Tuple, List
-from PySide6 import QtCore, QtGui, QtWidgets
+from typing import Callable, Dict, Literal, Optional, Tuple, List
+from PySide6 import QtCore, QtGui, QtNetwork, QtWidgets
 from windows_toasts import WindowsToaster, Toast, ToastDuration, ToastDisplayImage
 from Backend.AWCCThermal import AWCCThermal, NoAWCCWMIClass, CannotInstAWCCWMI
 from GUI.QRadioButtonSet import QRadioButtonSet
@@ -11,12 +11,14 @@ from GUI.QGaugeTrayIcon import QGaugeTrayIcon
 from GUI import HotKey
 from GUI.FanCurve import FanCurve
 from GUI.HistoryChartWidget import HistoryBuffer
-from GUI.SettingsDialog import SettingsDialog
+from GUI.SettingsDialog import SettingsDialog, TAB_DIAGNOSTICS
 from GUI.SettingsKeys import SettingsKey
 from Backend import PowerMonitor, GameDetector
+from Backend.AppLog import logPath
 from Backend.DetectHardware import DetectHardware
 
 GUI_ICON = 'icons/gaugeIcon.png'
+SINGLE_INSTANCE_NAME = 'TCC-G15-ZH-SingleInstance'
 
 def resourcePath(relativePath: str = '.'):
     return os.path.join(sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.abspath('.'), relativePath)
@@ -124,12 +126,16 @@ class TCC_GUI(QtWidgets.QWidget):
     SILENT_BAND_MARGIN = 5          # 降档需低于当前档位下界这么多度（档位滞环）
     SILENT_DOWN_COOLDOWN_SEC = 45   # 上次升档后至少等这么久才允许降档，避免风扇反复启停
     SILENT_REASSERT_SEC = 25        # 即使档位没变也定期重发一次，防止 EC 自行接管回自动曲线
+    # 转速渐变：一次性从 30% 跳到 65% 会有明显的“呼”声，改成每秒走几步
+    SILENT_RAMP_UP_PCT_PER_SEC = 30    # 升温提转速要快：0→100% 约 3.3 秒
+    SILENT_RAMP_DOWN_PCT_PER_SEC = 6   # 降速要慢，避免转速骤降后又被拉起来
     APP_NAME = "Thermal Control Center for Dell G15"
     APP_NAME_ZH = "Dell G15 散热控制中心"
-    APP_VERSION = "1.6.5"
+    APP_VERSION = "1.6.6-zh"
     APP_DESCRIPTION = "本软件是 Alienware Control Center（AWCC）的开源替代品 "
-    APP_URL = "github.com/AlexIII/tcc-g15"
-    APP_LOCALIZED_BY = "中文本地化：WorkBuddy"
+    APP_URL = "github.com/AlexIII/tcc-g15"          # 同时是 QSettings 的组织名，不能改
+    APP_REPO_URL = "github.com/ybq9430/tcc-g15-zh"  # 汉化与增强版仓库
+    APP_LOCALIZED_BY = "中文本地化与增强：ybq9430"
 
     # Green to Yellow and Yellow to Red thresholds
     GPU_COLOR_LIMITS = (72, 85)
@@ -144,6 +150,11 @@ class TCC_GUI(QtWidgets.QWidget):
     _silentLastBand: dict = {}                          # 静音模式：上次生效的档位索引（用于滞环）
     _silentLastChangeTs: dict = {}                      # 静音模式：上次改速的时间戳（用于降档冷静期）
     _silentLastWriteTs: dict = {}                       # 静音模式：上次写 EC 的时间戳（用于定期重申）
+    _silentCurrentSpeed: dict = {}                      # 静音模式：当前实际转速（浮点，用于渐变）
+    _silentLastWrittenSpeed: dict = {}                  # 静音模式：上次真正写进 EC 的整数转速
+    _lastCustomSpeed: Optional[Tuple[int, int]] = None  # 上次用户手动设定的 (CPU, GPU) 转速
+    _appliedMode: str = ThermalMode.Balanced.value      # 后端当前真正生效的模式
+    _suppressModeChange = False                         # True 时不响应模式切换（用于回滚）
 
     _lastAcState: Optional[bool] = None                 # 上次看到的供电状态，用于检测交流/电池切换
     _gameActive = False                                 # 当前是否判定在跑全屏游戏
@@ -167,8 +178,15 @@ class TCC_GUI(QtWidgets.QWidget):
         self.settings = QtCore.QSettings(self.APP_URL, "AWCC")
         print(f'Settings location: {self.settings.fileName()}')
 
-        # 静音曲线与历史缓冲：对话框和主界面共享同一份对象
-        self._curve = FanCurve.fromJson(self.settings.value(SettingsKey.SilentCurveJson.value) or '')
+        # 静音曲线：GPU / CPU 各一条，对话框和主界面共享同一份对象。
+        # 旧版本只有一条共用曲线（app/silent/curve_json），它是按 GPU 温度调的，
+        # 直接套给 CPU 会让 CPU 长期停在 0% 档，所以只迁移给 GPU，CPU 走默认值。
+        legacy = self.settings.value(SettingsKey.SilentCurveJsonLegacy.value) or ''
+        rawGpu = self.settings.value(SettingsKey.SilentCurveGpuJson.value) or legacy
+        rawCpu = self.settings.value(SettingsKey.SilentCurveCpuJson.value) or ''
+        self._curveGpu = FanCurve.fromJson(rawGpu, 'gpu')
+        self._curveCpu = FanCurve.fromJson(rawCpu, 'cpu')
+        self._curves: Dict[str, FanCurve] = {'gpu': self._curveGpu, 'cpu': self._curveCpu}
         self._history = HistoryBuffer(self.HISTORY_CAPACITY)
 
         # Set main window props
@@ -177,7 +195,12 @@ class TCC_GUI(QtWidgets.QWidget):
         self.setWindowIcon(QtGui.QIcon(resourcePath(GUI_ICON)))
         self.mouseReleaseEvent = lambda evt: (
             evt.button() == QtCore.Qt.RightButton and
-            alert("关于", f"{self.APP_NAME_ZH} v{self.APP_VERSION}", message2 = f"{self.APP_DESCRIPTION}\n{self.APP_URL}\n{self.APP_LOCALIZED_BY}")
+            alert("关于", f"{self.APP_NAME_ZH} v{self.APP_VERSION}",
+                  message2=(f"{self.APP_DESCRIPTION}\n"
+                            f"上游项目：{self.APP_URL}\n"
+                            f"汉化与增强：{self.APP_REPO_URL}\n"
+                            f"{self.APP_LOCALIZED_BY}\n\n"
+                            f"运行日志：{logPath()}"))
         )
 
         # Set up tray icon
@@ -195,14 +218,16 @@ class TCC_GUI(QtWidgets.QWidget):
         showAction = menu.addAction("显示主界面")
         showAction.triggered.connect(self.showNormal)
         settingsAction = menu.addAction("设置…")
-        settingsAction.triggered.connect(self.openSettings)
+        settingsAction.triggered.connect(lambda: self.openSettings())
+        historyAction = menu.addAction("查看温度历史…")
+        historyAction.triggered.connect(lambda: self.openHistory())
         addToAutorunAction = menu.addAction("启用开机自启")
         def autorunTaskRun(action: Literal['add', 'remove']) -> None:
             err = autorunTask(action)
             if err != 0 and action == 'add':
-                alert("错误", f"创建开机自启任务失败。错误码={err}", QtWidgets.QMessageBox.Icon.Critical)
+                self.trayMessage("开机自启", f"创建计划任务失败，错误码 {err}", critical=True)
             else:
-                alert("成功", f"开机自启已{'启用' if action == 'add' else '关闭'}")
+                self.trayMessage("开机自启", "已启用" if action == 'add' else "已关闭")
             # When in minimized state, a wired bug causes the app to close if we won't touch some of the `self.show*()` methods
             if self.isMinimized():
                 self.showMinimized()
@@ -219,6 +244,7 @@ class TCC_GUI(QtWidgets.QWidget):
         tray.setIcon(self.trayIcon)
         tray.setContextMenu(menu)
         tray.show()
+        self._tray = tray
 
         def onTrayIconActivated(trigger):
             if trigger == QtWidgets.QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -328,7 +354,7 @@ class TCC_GUI(QtWidgets.QWidget):
         settingsRow = QtWidgets.QHBoxLayout()
         self._settingsBtn = QtWidgets.QPushButton("设置…")
         self._settingsBtn.setToolTip("编辑静音风扇曲线、配置电源联动与游戏检测、查看温度历史")
-        self._settingsBtn.clicked.connect(self.openSettings)
+        self._settingsBtn.clicked.connect(lambda: self.openSettings())
         settingsRow.addStretch(1)
         settingsRow.addWidget(self._settingsBtn)
 
@@ -355,24 +381,50 @@ class TCC_GUI(QtWidgets.QWidget):
         self._thermalGPU.speedSliderChanged(updateFanSpeed)
         self._thermalCPU.speedSliderChanged(updateFanSpeed)
 
-        def onModeChange(val: str):
+        def refreshModeControls(val: str) -> None:
+            """按模式刷新滑块可用状态和托盘勾选"""
             self._thermalGPU.setSpeedDisabled(val != ThermalMode.Custom.value)
             self._thermalCPU.setSpeedDisabled(val != ThermalMode.Custom.value)
-            self._silentLastBand = {}
-            self._silentLastChangeTs = {}
-            self._silentLastWriteTs = {}
+            for m in ThermalMode:
+                self._trayMenuModeSwitch[m.value].setText(
+                    f"{'•' if m.value == val else ' '} {modeDisplayName(m.value)}")
+
+        def onModeChange(val: str):
+            if self._suppressModeChange:
+                return
             # 静音模式后端没有对应的 WMI 值，复用 Custom 让 EC 交出风扇控制权，再由软件曲线控速
             backendVal = BACKEND_MODE_PASSTHROUGH.get(val, val)
             res = self._awcc.setMode(self._awcc.Mode[backendVal])
-            print(f'Set mode {val} (backend {backendVal}): ' + ('ok' if res else 'fail'))
             if not res:
-                self._errorExit(f"切换到「{modeDisplayName(val)}」失败", "程序即将退出")
+                # 睡眠唤醒后第一次调用 WMI 失败很常见，重试一次再判死刑
+                print(f'Set mode {val} (backend {backendVal}) failed, retrying once...')
+                time.sleep(0.1)
+                res = self._awcc.setMode(self._awcc.Mode[backendVal])
+            if not res:
+                # 一次瞬时失败不该把整个程序杀掉，回滚 UI 状态并提示
+                prev = self._appliedMode
+                print(f'Set mode {val} failed twice, keeping {prev}')
+                self._suppressModeChange = True
+                try:
+                    self._modeSwitch.setChecked(prev)
+                finally:
+                    self._suppressModeChange = False
+                refreshModeControls(prev)
+                self.trayMessage(
+                    "切换失败",
+                    f"无法切换到「{modeDisplayName(val)}」，已保持「{modeDisplayName(prev)}」。"
+                    "若反复出现，请确认程序以管理员身份运行。",
+                    critical=True)
+                return
+
+            self._appliedMode = val
+            print(f'Set mode {val} (backend {backendVal}): ok')
+            refreshModeControls(val)
+            self._resetSilentState()
             updateFanSpeed()
             if val != ThermalMode.G_Mode.value:
                 self._failsafeTrippedPrevModeStr = None # In case the mode was switched manually
             updFailsafeIndicator()
-            for m in ThermalMode:
-                self._trayMenuModeSwitch[m.value].setText(f"{'•' if m.value == val else ' '} {modeDisplayName(m.value)}")
             # 用户手动改模式时，取消「退出游戏后恢复原模式」的打算，免得覆盖用户的选择
             if not self._autoSwitchGuard and self._gameActive and val != ThermalMode.G_Mode.value:
                 self._gamePrevMode = None
@@ -463,45 +515,71 @@ class TCC_GUI(QtWidgets.QWidget):
         self._modeSwitch.setToolTipFor(
             ThermalMode.Silent.value,
             "风扇按温度分档自动调速，日常负载下保持最低转速：\n"
-            f"{self._curve.describe()}\n\n"
-            "降温后需等 45 秒才降档，避免风扇反复启停。\n"
+            f"GPU：{self._curveGpu.describe()}\n"
+            f"CPU：{self._curveCpu.describe()}\n\n"
+            "转速平滑过渡（升快降慢），降温后需等 45 秒才降档，避免风扇反复启停。\n"
             "曲线可在「设置 → 风扇曲线」里拖动调整。\n\n"
             "注意：本机手动转速下限约 2600 RPM，与空载时的自动转速接近，\n"
             "所以静音模式的收益主要在中等负载时不急着提速，而不是让空载更安静。\n"
             "温度保护依然有效，超过阈值仍会切到 G 模式。"
         )
 
-    def _onCurveChanged(self) -> None:
-        self.settings.setValue(SettingsKey.SilentCurveJson.value, self._curve.toJson())
-        self.settings.sync()
-        self._refreshSilentTooltip()
-        # 曲线变了，旧的档位记录全部作废，下一拍重新按新曲线下发
+    def _resetSilentState(self) -> None:
+        """档位/渐变状态全部作废，下一拍重新按当前曲线下发"""
         self._silentLastBand = {}
         self._silentLastChangeTs = {}
         self._silentLastWriteTs = {}
-        print(f'静音曲线已更新: {self._curve.describe()}')
+        self._silentCurrentSpeed = {}
+        self._silentLastWrittenSpeed = {}
+
+    def _onCurveChanged(self) -> None:
+        self.settings.setValue(SettingsKey.SilentCurveGpuJson.value, self._curveGpu.toJson())
+        self.settings.setValue(SettingsKey.SilentCurveCpuJson.value, self._curveCpu.toJson())
+        # 旧键保留但清空，避免下次启动又把老的共用曲线当成 GPU 曲线读回来
+        self.settings.remove(SettingsKey.SilentCurveJsonLegacy.value)
+        self.settings.sync()
+        self._refreshSilentTooltip()
+        self._resetSilentState()
+        print(f'静音曲线已更新 GPU: {self._curveGpu.describe()} | CPU: {self._curveCpu.describe()}')
 
     # ---------- 设置对话框 ----------
 
-    def openSettings(self) -> None:
-        if getattr(self, '_settingsDialog', None) is not None:
-            try:
-                self._settingsDialog.close()
-            except Exception:
-                pass
-        dlg = SettingsDialog(
-            self._curve, self.settings, self._history,
-            tempsProvider=lambda: (self._thermalGPU.getTemp(), self._thermalCPU.getTemp()),
-            sensorScanner=lambda: self._awcc.probeSensors(12),
-            parent=self,
-        )
-        dlg.curveChanged.connect(self._onCurveChanged)
-        dlg.hotKeyChanged.connect(self._onHotKeyChanged)
-        dlg.automationChanged.connect(self._onAutomationChanged)
-        self._settingsDialog = dlg
+    def openSettings(self, tab: int = 0) -> None:
+        # 复用同一个对话框实例：每次新建会累积 QDialog，而且每次都要重跑一遍
+        # 阻塞式的传感器扫描（约 1 秒），第二三次打开照样卡。
+        if getattr(self, '_settingsDialog', None) is None:
+            dlg = SettingsDialog(
+                self._curves, self.settings, self._history,
+                tempsProvider=lambda: (self._thermalGPU.getTemp(), self._thermalCPU.getTemp()),
+                sensorScanner=lambda: self._awcc.probeSensors(12),
+                parent=self,
+            )
+            dlg.curveChanged.connect(self._onCurveChanged)
+            dlg.hotKeyChanged.connect(self._onHotKeyChanged)
+            dlg.automationChanged.connect(self._onAutomationChanged)
+            self._settingsDialog = dlg
+        dlg = self._settingsDialog
+        dlg.selectTab(tab)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def openHistory(self) -> None:
+        """托盘菜单直达温度历史"""
+        self.openSettings(TAB_DIAGNOSTICS)
+
+    def trayMessage(self, title: str, message: str, critical: bool = False) -> None:
+        """托盘气泡，替代每次点菜单都弹出来的模态对话框"""
+        icon = (QtWidgets.QSystemTrayIcon.MessageIcon.Critical if critical
+                else QtWidgets.QSystemTrayIcon.MessageIcon.Information)
+        try:
+            tray = getattr(self, '_tray', None)
+            if tray is not None:
+                tray.showMessage(title, message, icon, 4000)
+            else:
+                alert(title, message)
+        except Exception as ex:
+            print(f'托盘气泡发送失败: {ex}')
 
     # ---------- 热键 ----------
 
@@ -554,8 +632,10 @@ class TCC_GUI(QtWidgets.QWidget):
             return
         if self._lastAcState is None:
             self._lastAcState = onAc
-            return
-        if onAc == self._lastAcState:
+            if onAc:
+                return      # 插着电启动：不去动它，用户可能就想用 G 模式
+            # 电池启动：立即应用一次设定，不必等到拔插一次才生效
+        elif onAc == self._lastAcState:
             return
         self._lastAcState = onAc
         if onAc:
@@ -610,39 +690,65 @@ class TCC_GUI(QtWidgets.QWidget):
         self._gameCandidateSince = 0.0
         self._gameIdleSince = 0.0
 
-    def _silentBandIndex(self, temp: Optional[int]) -> int:
-        """温度落在曲线第几档；读不到温度时按最高档处理，宁可吵不可热"""
-        return self._curve.bandIndex(temp)
-
     def _applySilentCurve(self, gpuTemp: Optional[int], cpuTemp: Optional[int]) -> None:
-        """静音模式核心：按温度查档，升档立即生效，降档必须跌出当前档位下界一段才生效"""
+        """静音模式核心：按温度查档，升档立即生效，降档必须跌出当前档位下界一段才生效。
+
+        GPU 与 CPU 各用一条曲线（CPU 温度基线更高）。
+        转速不是一步跳到目标值，而是按每秒固定幅度渐变——一次性从 30% 跳到 65%
+        会有明显的“呼”一声，比温度本身更扰人。升快降慢。
+        """
+        now = time.time()
         targets = (
-            ('GPU', self._thermalGPU, self._awcc.GPUFanIdx, gpuTemp),
-            ('CPU', self._thermalCPU, self._awcc.CPUFanIdx, cpuTemp),
+            ('GPU', self._thermalGPU, self._awcc.GPUFanIdx, gpuTemp, self._curveGpu),
+            ('CPU', self._thermalCPU, self._awcc.CPUFanIdx, cpuTemp, self._curveCpu),
         )
-        for name, unit, fanIdx, temp in targets:
-            idx = self._silentBandIndex(temp)
+        for name, unit, fanIdx, temp, curve in targets:
+            idx = curve.bandIndex(temp)
             last = self._silentLastBand.get(name)
             if last is None or idx > last:
                 newIdx = idx                                   # 首次或升温升档：立即执行
             elif idx < last:
-                lowerEdge = self._curve.bandLowerEdge(last)
-                cooledDown = (time.time() - self._silentLastChangeTs.get(name, 0)) >= self.SILENT_DOWN_COOLDOWN_SEC
+                lowerEdge = curve.bandLowerEdge(last)
+                cooledDown = (now - self._silentLastChangeTs.get(name, 0)) >= self.SILENT_DOWN_COOLDOWN_SEC
                 if cooledDown and temp is not None and temp <= lowerEdge - self.SILENT_BAND_MARGIN:
                     newIdx = max(idx, last - 1)                # 降档每次最多退一档，避免转速骤降后又反弹
                 else:
                     newIdx = last
             else:
                 newIdx = last
-            if last is not None and newIdx == last:
-                # 档位没变：正常情况下不写 EC，但定期重申一次，防止被 EC 自动曲线接管
-                if (time.time() - self._silentLastWriteTs.get(name, 0)) < self.SILENT_REASSERT_SEC:
-                    continue
-            speed = self._curve.speeds[newIdx]
+
+            target = curve.speeds[newIdx]
+            cur = self._silentCurrentSpeed.get(name)
+            if cur is None:
+                # 首帧从当前实际转速出发，避免切进静音模式时转速突然跳变
+                cur = float(unit.getSpeedSlider())
+                dt = 1.0
+            else:
+                dt = now - self._silentLastWriteTs.get(name, now)
+                dt = max(0.2, min(5.0, dt))
+            rate = (self.SILENT_RAMP_UP_PCT_PER_SEC if target > cur
+                    else self.SILENT_RAMP_DOWN_PCT_PER_SEC)
+            step = rate * dt
+            if abs(target - cur) <= step:
+                cur = float(target)
+            elif target > cur:
+                cur += step
+            else:
+                cur -= step
+
+            speed = int(round(cur))
+            lastWritten = self._silentLastWrittenSpeed.get(name)
+            steady = (newIdx == last and speed == lastWritten)
+            if steady and (now - self._silentLastWriteTs.get(name, 0)) < self.SILENT_REASSERT_SEC:
+                # 档位和转速都没变：正常情况下不写 EC，但隔一会儿重申一次，防 EC 接管
+                continue
+
             self._silentLastBand[name] = newIdx
-            self._silentLastWriteTs[name] = time.time()
+            self._silentCurrentSpeed[name] = cur
+            self._silentLastWrittenSpeed[name] = speed
+            self._silentLastWriteTs[name] = now
             if newIdx != last:
-                self._silentLastChangeTs[name] = time.time()
+                self._silentLastChangeTs[name] = now
             unit.setSpeedSliderSilently(speed)
             res = self._awcc.setFanSpeed(fanIdx, speed)
             print(f'静音: {name} {temp}C -> 档位 {newIdx}, 风扇 {speed}% ' + ('ok' if res else 'fail'))
@@ -730,10 +836,21 @@ class TCC_GUI(QtWidgets.QWidget):
             print(f'系统通知发送失败（忽略）: {ex}')
 
     def _saveAppSettings(self):
+        # 静音模式下滑块会被曲线每秒改写，那个值不是用户选的「自定义转速」。
+        # 直接存下去会让用户切回自定义时发现转速莫名变成 0% 或 100%，所以用快照。
+        isSilent = self._modeSwitch.getChecked() == ThermalMode.Silent.value
+        if isSilent and self._lastCustomSpeed is not None:
+            cpuSpeed, gpuSpeed = self._lastCustomSpeed
+        else:
+            cpuSpeed = self._thermalCPU.getSpeedSlider()
+            gpuSpeed = self._thermalGPU.getSpeedSlider()
+            if not isSilent:
+                self._lastCustomSpeed = (cpuSpeed, gpuSpeed)
+
         curValues = [
             self._modeSwitch.getChecked(),
-            self._thermalCPU.getSpeedSlider(),
-            self._thermalGPU.getSpeedSlider(),
+            cpuSpeed,
+            gpuSpeed,
             self.FAILSAFE_CPU_TEMP,
             self.FAILSAFE_GPU_TEMP,
             self._failsafeOn
@@ -743,8 +860,8 @@ class TCC_GUI(QtWidgets.QWidget):
         self._prevSavedSettingsValues = curValues
 
         self.settings.setValue(SettingsKey.Mode.value, self._modeSwitch.getChecked())
-        self.settings.setValue(SettingsKey.CPUFanSpeed.value, self._thermalCPU.getSpeedSlider())
-        self.settings.setValue(SettingsKey.GPUFanSpeed.value, self._thermalGPU.getSpeedSlider())
+        self.settings.setValue(SettingsKey.CPUFanSpeed.value, cpuSpeed)
+        self.settings.setValue(SettingsKey.GPUFanSpeed.value, gpuSpeed)
         self.settings.setValue(SettingsKey.CPUThresholdTemp.value, self.FAILSAFE_CPU_TEMP)
         self.settings.setValue(SettingsKey.GPUThresholdTemp.value, self.FAILSAFE_GPU_TEMP)
         self.settings.setValue(SettingsKey.FailSafeIsOnFlag.value, self._failsafeOn)
@@ -764,12 +881,32 @@ class TCC_GUI(QtWidgets.QWidget):
         self._limitTempGPU.setCurrentText(str(savedTemp))
         savedFailsafe = self.settings.value(SettingsKey.FailSafeIsOnFlag.value) or 'true'
         self._failsafeCB.setChecked(str(savedFailsafe).lower() == 'true')
+        # 记住用户自定义模式的转速，静音模式下 _saveAppSettings 会用这份快照
+        self._lastCustomSpeed = (self._thermalCPU.getSpeedSlider(),
+                                 self._thermalGPU.getSpeedSlider())
+        self._prevSavedSettingsValues = []
 
     def clearAppSettings(self):
-        (isYes, _) = confirm("恢复默认设置", "要把所有设置恢复为默认值吗？", ("恢复", "取消"))
+        (isYes, _) = confirm("恢复默认设置", "要把所有设置恢复为默认值吗？\n"
+                              "包括模式、转速、温度阈值、风扇曲线、自动化、热键。", ("恢复", "取消"))
         if not isYes: return
         self.settings.clear()
+        # 曲线对象是共享引用，必须一起重置，否则界面上还显示旧曲线、
+        # 下次保存时又把旧值写回去
+        self._curveGpu.reset()
+        self._curveCpu.reset()
+        self._resetSilentState()
+        self._refreshSilentTooltip()
         self._loadAppSettings()
+        self._lastAcState = None
+        self._onAutomationChanged()
+        self._startHotKey()
+        if getattr(self, '_settingsDialog', None) is not None:
+            try:
+                self._settingsDialog.reloadFromSettings()
+            except Exception as ex:
+                print(f'刷新设置窗口失败: {ex}')
+        print('设置已恢复默认')
 
     def G_Mode_key_Pressed(self, val):
         print("G_Mode_key " + str(val))
@@ -864,8 +1001,77 @@ def applyAppStylesheet(widget: QtWidgets.QWidget) -> None:
         }}
     """)
 
+_singleInstanceMemory: Optional[QtCore.QSharedMemory] = None
+
+
+def _acquireSingleInstance() -> bool:
+    """原子地判断是不是第一个实例。
+
+    用共享内存而不是临时文件：进程退出（包括崩溃）时系统自动回收，
+    不会有残留的锁文件把下次启动挡住。必须保留引用，否则段被回收后
+    第二个实例又能创建成功。
+    """
+    global _singleInstanceMemory
+    mem = QtCore.QSharedMemory(SINGLE_INSTANCE_NAME)
+    if mem.create(1):
+        _singleInstanceMemory = mem
+        return True
+    if mem.error() == QtCore.QSharedMemory.SharedMemoryError.AlreadyExists:
+        print('检测到已有实例在运行')
+        return False
+    # 其它错误（权限等）一律放行，别把程序锁死
+    print(f'单实例检测异常（忽略）: {mem.errorString()}')
+    return True
+
+
+def _notifyRunningInstance() -> bool:
+    """请已经运行的实例把窗口显示出来。做不到就返回 False，由调用方给提示。"""
+    try:
+        sock = QtNetwork.QLocalSocket()
+        sock.connectToServer(SINGLE_INSTANCE_NAME)
+        if not sock.waitForConnected(400):
+            return False
+        sock.write(b'show\n')
+        sock.flush()
+        sock.waitForBytesWritten(400)
+        sock.disconnectFromServer()
+        return True
+    except Exception as ex:
+        print(f'唤醒已有实例失败: {ex}')
+        return False
+
+
+def _startInstanceServer(window: QtWidgets.QWidget) -> Optional[QtNetwork.QLocalServer]:
+    """监听第二个实例发来的“显示窗口”请求"""
+    server = QtNetwork.QLocalServer(window)
+    if not server.listen(SINGLE_INSTANCE_NAME):
+        # 这里刻意不做 removeServer 重试：万一是另一个实例正在监听，
+        # 删名字会把它的管道搞坏，等于两个实例互相打架。
+        print(f'实例监听未启动（不影响使用）: {server.errorString()}')
+        return None
+
+    def onNewConnection() -> None:
+        while server.hasPendingConnections():
+            conn = server.nextPendingConnection()
+            if conn is not None:
+                conn.disconnectFromServer()
+                conn.deleteLater()
+        window.showNormal()
+        window.activateWindow()
+        window.raise_()
+
+    server.newConnection.connect(onNewConnection)
+    return server
+
+
 def runApp(startMinimized = False) -> int:
     app = QtWidgets.QApplication([])
+
+    if not _acquireSingleInstance():
+        if not _notifyRunningInstance():
+            alert("程序已在运行", "散热控制中心已经启动过了，请在系统托盘里找到它。")
+        return 0
+
     installChineseTranslator(app)
 
     # Setup backend
@@ -878,6 +1084,7 @@ def runApp(startMinimized = False) -> int:
 
     mainWindow = TCC_GUI(awcc)
     applyAppStylesheet(mainWindow)
+    mainWindow._instanceServer = _startInstanceServer(mainWindow)
 
     if startMinimized:
         mainWindow.showMinimized()

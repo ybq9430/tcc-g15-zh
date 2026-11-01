@@ -153,7 +153,11 @@ class HistoryChartWidget(QtWidgets.QWidget):
             x += 88
 
         span = int(samples[-1][0] - samples[0][0])
+        if span >= 120:
+            spanText = f"最近 {span // 60} 分钟"
+        else:
+            spanText = f"最近 {span} 秒"
         p.setPen(labelPen)
         p.drawText(QtCore.QRectF(r.left(), r.bottom() + 6, r.width(), 16),
-                   QtCore.Qt.AlignCenter, f"最近 {span} 秒 · {count} 个采样")
+                   QtCore.Qt.AlignCenter, f"{spanText} · {count} 个采样")
         p.end()
