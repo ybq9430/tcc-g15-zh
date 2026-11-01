@@ -38,6 +38,11 @@ class QRadioButtonSet(QtWidgets.QWidget):
     def setOnChange(self, callback: Callable[[str], None]) -> None:
         self._userCallback = callback
 
+    def setToolTipFor(self, value: str, text: str) -> None:
+        rb = self._buttons.get(value)
+        if rb is not None:
+            rb.setToolTip(text)
+
     @QtCore.Slot()
     def _onClicked(self):
         rb = self.sender() # type: QtWidgets.QRadioButton

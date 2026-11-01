@@ -75,12 +75,22 @@ class QPeriodic:
 
 class ThermalMode(Enum):
     Balanced = 'Balanced'
+    Silent = 'Silent'      # 本版本新增：软件模拟的静音模式（后端复用 Custom 接管风扇）
     G_Mode = 'G_Mode'
     Custom = 'Custom'
+
+# 后端不认识 Silent，需要映射到它支持的 WMI 模式值
+BACKEND_MODE_PASSTHROUGH = {
+    ThermalMode.Balanced.value: 'Balanced',
+    ThermalMode.G_Mode.value: 'G_Mode',
+    ThermalMode.Custom.value: 'Custom',
+    ThermalMode.Silent.value: 'Custom',   # 静音 = 切到 Custom 让 EC 交出风扇控制权
+}
 
 # 中文显示名（枚举值本身不能改，否则会破坏与后端/配置文件的对应关系）
 MODE_NAMES_ZH = {
     ThermalMode.Balanced.value: '平衡模式',
+    ThermalMode.Silent.value: '静音模式',
     ThermalMode.G_Mode.value: 'G 模式',
     ThermalMode.Custom.value: '自定义',
 }
@@ -110,6 +120,13 @@ class TCC_GUI(QtWidgets.QWidget):
     FAILSAFE_GPU_TEMP = 85
     FAILSAFE_TRIGGER_DELAY_SEC = 8
     FAILSAFE_RESET_AFTER_TEMP_IS_OK_FOR_SEC = 60
+    # 静音模式风扇曲线：(温度上限 °C, 风扇百分比)，取第一个满足 temp < 上限 的档位
+    # 本机 A/B 实测（空载）：平衡模式 2607/2827RPM ≈ 手动 0% 2605/2815RPM，手动 5% 已升到 3084/3241
+    # 所以底档必须是 0%，且边界要高于空载温度（约 64-70°C），否则会形成极限环、风扇反复启停
+    SILENT_CURVE = ((82, 0), (87, 30), (91, 65), (999, 100))
+    SILENT_BAND_MARGIN = 5          # 降档需低于当前档位下界这么多度（档位滞环）
+    SILENT_DOWN_COOLDOWN_SEC = 45   # 上次升档后至少等这么久才允许降档，避免风扇反复启停
+    SILENT_REASSERT_SEC = 25        # 即使档位没变也定期重发一次，防止 EC 自行接管回自动曲线
     APP_NAME = "Thermal Control Center for Dell G15"
     APP_NAME_ZH = "Dell G15 散热控制中心"
     APP_VERSION = "1.6.5"
@@ -127,6 +144,9 @@ class TCC_GUI(QtWidgets.QWidget):
     _failsafeTrippedPrevModeStr: Optional[str] = None   # Mode (Custom, Balanced) before fail-safe tripped, as a string
     _failsafeOn = True
     _prevSavedSettingsValues: list = []
+    _silentLastBand: dict = {}                          # 静音模式：上次生效的档位索引（用于滞环）
+    _silentLastChangeTs: dict = {}                      # 静音模式：上次改速的时间戳（用于降档冷静期）
+    _silentLastWriteTs: dict = {}                       # 静音模式：上次写 EC 的时间戳（用于定期重申）
 
     _gModeKeySignal = QtCore.Signal()
     _gModeKeyPrevModeStr: Optional[str] = None
@@ -199,9 +219,9 @@ class TCC_GUI(QtWidgets.QWidget):
         self.setObjectName('QMainWindow')
         self.setWindowTitle(self.APP_NAME_ZH)
 
-        self._thermalGPU = ThermalUnitWidget(self, tempMinMax= (0, 95), tempColorLimits= self.GPU_COLOR_LIMITS, fanMinMax= (0, 5500), sliderMaxAndTick= (120, 20))
+        self._thermalGPU = ThermalUnitWidget(self, tempMinMax= (0, 95), tempColorLimits= self.GPU_COLOR_LIMITS, fanMinMax= (0, 5500), sliderMaxAndTick= (100, 20))
         self._thermalGPU.setTitle('GPU')
-        self._thermalCPU = ThermalUnitWidget(self, tempMinMax= (0, 110), tempColorLimits= self.CPU_COLOR_LIMITS, fanMinMax= (0, 5500), sliderMaxAndTick= (120, 20))
+        self._thermalCPU = ThermalUnitWidget(self, tempMinMax= (0, 110), tempColorLimits= self.CPU_COLOR_LIMITS, fanMinMax= (0, 5500), sliderMaxAndTick= (100, 20))
         self._thermalCPU.setTitle('CPU')
 
         # Detecting GPU/CPU model is a slow operation, run asynchronously
@@ -232,6 +252,20 @@ class TCC_GUI(QtWidgets.QWidget):
         lTherm.addWidget(self._thermalCPU)
 
         self._modeSwitch = QRadioButtonSet(None, None, list(map(lambda m: (modeDisplayName(m.value), m.value), ThermalMode)))
+        self._modeSwitch.setToolTipFor(
+            ThermalMode.Silent.value,
+            "风扇按温度分档自动调速，日常负载下保持最低转速：\n"
+            "82°C 以下·最低　87°C·30%　91°C·65%　91°C 以上·满转\n"
+            "降温后需等 45 秒才降档，避免风扇反复启停。\n\n"
+            "空载噪音与平衡模式相同，收益在于中等负载时不急着把风扇拉高。\n"
+            "注意：本机手动转速下限约 3000 RPM，与空载时的自动转速接近，\n"
+            "所以静音模式的收益主要在中等负载时不急着提速，而不是让空载更安静。\n"
+            "温度保护依然有效，超过阈值仍会切到 G 模式。"
+        )
+        self._modeSwitch.setToolTipFor(
+            ThermalMode.Custom.value,
+            "手动拖动下方滑块，直接指定风扇转速。\n有效范围 0~100，0% 约为硬件最低转速（约 3000 RPM），并非停转。"
+        )
 
         # Fail-safe indicator
         failsafeIndicator = QtWidgets.QLabel()
@@ -313,8 +347,13 @@ class TCC_GUI(QtWidgets.QWidget):
         def onModeChange(val: str):
             self._thermalGPU.setSpeedDisabled(val != ThermalMode.Custom.value)
             self._thermalCPU.setSpeedDisabled(val != ThermalMode.Custom.value)
-            res = self._awcc.setMode(self._awcc.Mode[val])
-            print(f'Set mode {val}: ' + ('ok' if res else 'fail'))
+            self._silentLastBand = {}
+            self._silentLastChangeTs = {}
+            self._silentLastWriteTs = {}
+            # 静音模式后端没有对应的 WMI 值，复用 Custom 让 EC 交出风扇控制权，再由软件曲线控速
+            backendVal = BACKEND_MODE_PASSTHROUGH.get(val, val)
+            res = self._awcc.setMode(self._awcc.Mode[backendVal])
+            print(f'Set mode {val} (backend {backendVal}): ' + ('ok' if res else 'fail'))
             if not res:
                 self._errorExit(f"切换到「{modeDisplayName(val)}」失败", "程序即将退出")
             updateFanSpeed()
@@ -340,6 +379,10 @@ class TCC_GUI(QtWidgets.QWidget):
             if cpuTemp is not None: self._thermalCPU.setTemp(cpuTemp)
             if cpuRPM is not None: self._thermalCPU.setFanRPM(cpuRPM)
             # print(gpuTemp, gpuRPM, cpuTemp, cpuRPM)
+
+            # 静音模式：按温度曲线自动调节风扇转速
+            if self._modeSwitch.getChecked() == ThermalMode.Silent.value:
+                self._applySilentCurve(gpuTemp, cpuTemp)
 
             # Handle fail-safe
             tempIsHigh = (
@@ -394,6 +437,51 @@ class TCC_GUI(QtWidgets.QWidget):
     def updateGaugeTitles(self, gpuModel, cpuModel):
         if gpuModel: self._thermalGPU.setTitle(gpuModel)
         if cpuModel: self._thermalCPU.setTitle(cpuModel)
+
+    def _silentBandIndex(self, temp: Optional[int]) -> int:
+        """温度落在曲线第几档；读不到温度时按最高档处理，宁可吵不可热"""
+        if temp is None:
+            return len(self.SILENT_CURVE) - 1
+        for i, (limit, _) in enumerate(self.SILENT_CURVE):
+            if temp < limit:
+                return i
+        return len(self.SILENT_CURVE) - 1
+
+    def _applySilentCurve(self, gpuTemp: Optional[int], cpuTemp: Optional[int]) -> None:
+        """静音模式核心：按温度查档，升档立即生效，降档必须跌出当前档位下界一段才生效"""
+        targets = (
+            ('GPU', self._thermalGPU, self._awcc.GPUFanIdx, gpuTemp),
+            ('CPU', self._thermalCPU, self._awcc.CPUFanIdx, cpuTemp),
+        )
+        for name, unit, fanIdx, temp in targets:
+            idx = self._silentBandIndex(temp)
+            last = self._silentLastBand.get(name)
+            if last is None or idx > last:
+                newIdx = idx                                   # 首次或升温升档：立即执行
+            elif idx < last:
+                if last > 0:
+                    lowerEdge = self.SILENT_CURVE[last - 1][0]
+                else:
+                    lowerEdge = -1000
+                cooledDown = (time.time() - self._silentLastChangeTs.get(name, 0)) >= self.SILENT_DOWN_COOLDOWN_SEC
+                if cooledDown and temp is not None and temp <= lowerEdge - self.SILENT_BAND_MARGIN:
+                    newIdx = max(idx, last - 1)                # 降档每次最多退一档，避免转速骤降后又反弹
+                else:
+                    newIdx = last
+            else:
+                newIdx = last
+            if last is not None and newIdx == last:
+                # 档位没变：正常情况下不写 EC，但定期重申一次，防止被 EC 自动曲线接管
+                if (time.time() - self._silentLastWriteTs.get(name, 0)) < self.SILENT_REASSERT_SEC:
+                    continue
+            speed = self.SILENT_CURVE[newIdx][1]
+            self._silentLastBand[name] = newIdx
+            self._silentLastWriteTs[name] = time.time()
+            if newIdx != last:
+                self._silentLastChangeTs[name] = time.time()
+            unit.setSpeedSliderSilently(speed)
+            res = self._awcc.setFanSpeed(fanIdx, speed)
+            print(f'静音: {name} {temp}C -> 档位 {newIdx}, 风扇 {speed}% ' + ('ok' if res else 'fail'))
 
     def closeEvent(self, event):
         minimizeOnClose = self.settings.value(SettingsKey.MinimizeOnCloseFlag.value)

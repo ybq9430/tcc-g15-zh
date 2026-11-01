@@ -87,6 +87,12 @@ class ThermalUnitWidget(QtWidgets.QWidget):
         if value > self._speedSlider.maximum(): value = self._speedSlider.maximum()
         self._speedSlider.setValue(value)
 
+    def setSpeedSliderSilently(self, value: int) -> None:
+        """更新滑块位置但不触发回调（用于静音模式自动控速，避免与用户回调互相干扰）"""
+        self._speedSlider.blockSignals(True)
+        self.setSpeedSlider(value)
+        self._speedSlider.blockSignals(False)
+
     @QtCore.Slot()
     def _onSpeedSliderChange(self) -> None:
         if self._speedSliderCallback:
