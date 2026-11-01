@@ -37,6 +37,8 @@ Dell G 系列 / Alienware 笔记本出厂自带的 AWCC（Alienware Command Cent
 
 ### 风扇曲线
 
+![风扇曲线编辑器](screenshots/curve-editor.png)
+
 **GPU 和 CPU 各有一条独立曲线**，用下拉框切换正在编辑的那条，另一条以黄色虚线画在图上作为对照。
 两条曲线分开设定是因为同一颗芯片的 CPU 温度基线通常比 GPU 高 6~10°C，
 共用一条曲线会让 CPU 长期顶在最高档、把风扇一路拉满，静音效果直接被吃掉。
@@ -63,6 +65,8 @@ Dell G 系列 / Alienware 笔记本出厂自带的 AWCC（Alienware Command Cent
 手动切换模式会覆盖自动化：如果游戏运行时你手动换了个模式，退出游戏后就不会被改回去。
 
 ### 诊断
+
+![温度历史](screenshots/history-diagnostics.png)
 
 - 温度与转速历史曲线（环形缓冲，约 30 分钟），可导出 CSV
 - 传感器总览。扫描结果里会显示全部有读数的传感器 ID —— 本机除 CPU/GPU 两路外，
